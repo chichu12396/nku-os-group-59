@@ -3,7 +3,7 @@
 #include <error.h>
 #include <stdio.h>
 #include <string.h>
-
+//格式化输入输出函数
 /* *
  * Space or zero padding and a field width are supported for the numeric
  * formats only.
