@@ -41,9 +41,9 @@
 
 | 成员 | AI 编程工具 | 底层模型 | 备注 |
 |------|------------|---------|------|
-| 2411033-季艾佳 | Cline（VS Code插件） | GPT-5.5]| |
-| 2412102-聂海丽 | | | |
-| 2413346-易响 | | | |
+| 2411033-季艾佳 | Cline（VS Code插件） | GPT-5.5| |
+| 2412102-聂海丽 |claudecode |deepseekv4flash | |
+| 2413346-易响 | DeepSeek Harness| DeepSeek-V4-Flash| |
 
 **说明：**
 - **AI 编程工具**：指具体使用的终端工具、编辑器插件、桌面应用或浏览器界面
@@ -75,31 +75,83 @@
 -->
 
 
-### 练习：[练习1]
+### 练习：练习1
 
-**负责人：** [学号-姓名]
+**负责人：** 2413346-易响
 
-[按照练习的具体要求进行解答]
+#### 1. 实验目的
+阅读 kern/init/entry.S内容代码，结合操作系统内核启动流程， 理解内核启动中的程序入口操作
+
+#### 2. 调试过程与现象记录
+
+```c
+#include <mmu.h>
+#include <memlayout.h>
+
+    .section .text,"ax",%progbits
+    .globl kern_entry
+kern_entry:
+    la sp, bootstacktop
+
+    tail kern_init
+
+.section .data
+    # .align 2^12
+    .align PGSHIFT
+    .global bootstack
+bootstack:
+    .space KSTACKSIZE
+    .global bootstacktop
+bootstacktop:
+```
+
+
+
+##### （1）解释指令 la sp, bootstacktop 
+
+`la` 是 RISC-V 汇编中的伪指令，其作用是将符号 `bootstacktop` 的地址加载到寄存器中。因此这条指令可以理解为：sp    ← bootstacktop，就是将内核启动栈的栈顶地址设置到栈指针寄存器 `sp` 中。  
+
+这样做的目的，是为后续执行 C 语言代码建立一个可用的内核栈环境。OpenSBI 将控制权交给内核时，内核刚刚开始执行，此时还没有准备好自己的 C 语言运行环境，而函数调用、局部变量以及寄存器保存等操作都需要依赖栈。因此，内核必须先设置好 `sp`，才能安全地进入后续的 `kern_init()` 函数。  
+
+##### （2）解释指令 tail kern_init  
+`tail kern_init` 的作用是：将处理器的控制权从内核启动入口 `kern_entry` 直接转移到 C 语言编写的 `kern_init()` 函数。
+
+这里的 `tail` 可以理解为一种**尾调用（tail call）**。和普通的函数调用不同，它不需要为当前函数保留一个等待返回的调用现场，而是直接跳转到目标函数。也就是说，内核启动流程可以理解为：
+
+```
+OpenSBI
+   ↓
+0x80200000
+   ↓
+kern_entry
+   ↓
+设置 sp
+   ↓
+tail kern_init
+   ↓
+kern_init()
+```
+这里采用 `tail` 形式而不是普通函数调用，是因为 `kern_init()` 不会返回，其内部最终进入无限循环，因此没有必要保留返回到 `kern_entry` 的调用关系。换言之，`tail kern_init` 的主要目的是在内核栈初始化完成后，将执行流程正式交给内核的 C 语言初始化代码
 
 ---
 
-### 练习：[练习2]
+### 练习：练习2
 
 **负责人：** 2412102-聂海丽
 
-### 1. 实验目的
+#### 1. 实验目的
 使用 GDB 跟踪 QEMU 模拟的 RISC-V 从加电开始，直到执行内核第一条指令（跳转到 `0x80200000`）的整个过程，熟悉 QEMU 与 GDB 的联合调试方法，并理解 RISC-V 硬件复位后 OpenSBI 的初始化逻辑。
 
-### 2. 调试过程与现象记录
+#### 2. 调试过程与现象记录
 
-#### （1）连接 QEMU 并停在复位地址
+##### （1）连接 QEMU 并停在复位地址
 在终端执行 `make gdb`，GDB 自动通过 `target remote localhost:1234` 连接到 QEMU。
 连接成功后，观察当前状态：
 - PC 寄存器停留在 `0x1000`，这是 RISC-V 硬件加电后的复位地址。
 - 此时 GDB 提示 `Reading symbols from bin/kernel...`，但当前仍在 OpenSBI 固件阶段。
 > ![GDB连接QEMU状态](images/001.png "GDB连接状态与 pc = 0x1000")
 
-#### （2）查看复位地址的初始化指令
+##### （2）查看复位地址的初始化指令
 使用 `x/10i $pc` 查看 `0x1000` 处的汇编指令：
 ```assembly
 => 0x1000:  auipc t0, 0x0
@@ -127,7 +179,7 @@ RISC-V 加电后的复位代码位于 0x1000。该段代码通过 auipc 获取�
 
 在查看 0x1000 处的复位指令时，发现 0x1018 处显示为 unimp（未实现指令）和 0x8000。结合 x/1gx 0x1018 观察到该地址存放的是 0x0000000080000000，这并非可执行代码，而是 jr t0 要跳转的基址。因为 GDB 误将数据段当作代码段反汇编，全 0 的数据被解析为了 unimp。这也侧面印证了 0x1018 处是跳转数据，而非指令。
 
-#### （3）使用 `watch` 观察内核被加载到内存
+##### （3）使用 `watch` 观察内核被加载到内存
 为了避免单步跟踪大量 OpenSBI 代码，在 GDB 中设置硬件观察点：
 ```gdb
 (gdb) watch *0x80200000
@@ -142,7 +194,7 @@ New value = ...
 ```
 >  ![watch](images/004.png "watch")
 
-#### （4）使用断点验证内核开始执行
+##### （4）使用断点验证内核开始执行
 删除观察点，并在内核入口地址 `0x80200000` 处设置断点，然后继续执行：
 ```gdb
 (gdb) delete
@@ -158,7 +210,7 @@ pc             0x80200000       0x80200000
 ```
 >  ![断点](images/005.png "断点")
 
-### 3. 思考题解答
+#### 3. 思考题解答
 **问题1：RISC-V 硬件加电后最初执行的几条指令位于什么地址？**
 答：位于 `0x1000`（复位地址）。根据实验观察，`0x1000` 到 `0x1014` 是复位后最先执行的一小段代码，随后通过 `jr t0` 跳转到 `0x80000000`。
 
@@ -175,6 +227,249 @@ pc             0x80200000       0x80200000
 
 ## 五、测试与验证
 
+
+### 练习一
+
+![](images/007.png)
+
+为了验证 `entry.S` 中两条指令的实际执行效果，使用 QEMU 和 RISC-V GDB 对内核启动过程进行单步调试。
+
+#### 1. 验证 `la sp, bootstacktop`
+
+首先启动 QEMU 调试模式，并使用 GDB 连接：
+
+```gdb
+set arch riscv:rv64
+target remote localhost:1234
+```
+
+连接成功后，GDB 显示：
+
+```text
+0x0000000000001000 in ?? ()
+```
+
+随后设置内核入口断点：
+
+```gdb
+b *0x80200000
+continue
+```
+
+程序停在：
+
+```text
+Breakpoint 1, kern_entry () at kern/init/entry.S:7
+7    la sp, bootstacktop
+```
+
+此时查看 `bootstacktop`：
+
+```gdb
+p/x &bootstacktop
+```
+
+得到：
+
+```text
+$2 = 0x80203000
+```
+
+在执行 `la sp, bootstacktop` 之前查看 `sp`：
+
+```gdb
+info registers sp
+```
+
+得到：
+
+```text
+sp = 0x80017ee0
+```
+
+然后执行单步：
+
+```gdb
+si
+```
+
+再次查看 `sp`：
+
+```gdb
+info registers sp
+```
+
+得到：
+
+```text
+sp = 0x80203000
+```
+
+再次查看：
+
+```gdb
+p/x &bootstacktop
+```
+
+结果为：
+
+```text
+$3 = 0x80203000
+```
+
+因此本次实验实际观察到：
+
+```text
+执行前：
+sp           = 0x80017ee0
+bootstacktop = 0x80203000
+
+执行 la 后：
+sp           = 0x80203000
+bootstacktop = 0x80203000
+```
+
+说明执行 `la sp, bootstacktop` 后，`sp` 的值发生了变化，并与 `bootstacktop` 的地址一致。
+
+
+
+进一步查看 `kern_entry` 的反汇编：
+
+```gdb
+x/4i 0x80200000
+```
+
+得到：
+
+```text
+0x80200000 <kern_entry>:    auipc sp,0x3
+0x80200004 <kern_entry+4>:  mv    sp,sp
+0x80200008 <kern_entry+8>:  j     0x8020000a <kern_init>
+0x8020000a <kern_init>:     auipc a0,0x3
+```
+
+可以看到 `la sp, bootstacktop` 对应的实际机器指令位于 `0x80200000` 和 `0x80200004`。
+
+------
+
+#### 2. 验证 `tail kern_init`
+
+在执行完 `la sp, bootstacktop` 后，继续使用 GDB 单步执行。
+
+
+
+执行：
+
+```gdb
+si
+```
+
+此时 GDB 停在：
+
+```text
+0x0000000080200008 in kern_entry () at kern/init/entry.S:9
+9    tail kern_init
+```
+
+查看当前 PC：
+
+```gdb
+p/x $pc
+```
+
+得到：
+
+```text
+$4 = 0x80200008
+```
+
+查看当前指令：
+
+```gdb
+x/i $pc
+```
+
+得到：
+
+```text
+=> 0x80200008 <kern_entry+8>:    j 0x8020000a <kern_init>
+```
+
+再次执行：
+
+```gdb
+si
+```
+
+GDB 进入：
+
+```text
+kern_init () at kern/init/init.c:8
+8    memset(edata, 0, end - edata);
+```
+
+此时查看 PC：
+
+```gdb
+p/x $pc
+```
+
+得到：
+
+```text
+$5 = 0x8020000a
+```
+
+查看当前指令：
+
+```gdb
+x/4i $pc
+```
+
+得到：
+
+```text
+0x8020000a <kern_init>:    auipc a0,0x3
+0x8020000e <kern_init+4>:  addi  a0,a0,-2
+0x80200012 <kern_init+8>:  auipc a2,0x3
+0x80200016 <kern_init+12>: addi  a2,a2,-10
+```
+
+因此实际执行过程为：
+
+```text
+PC = 0x80200008
+        ↓
+j 0x8020000a
+        ↓
+PC = 0x8020000a
+        ↓
+进入 kern_init()
+```
+
+由 GDB 单步结果可以确认，执行 `tail kern_init` 对应的跳转指令后，程序从 `kern_entry` 进入了 `kern_init()`。
+
+------
+
+#### 3. 验证结果
+
+本次调试得到的关键结果如下：
+
+| 验证内容            | 实际结果      |
+| ------------------- | ------------- |
+| `bootstacktop` 地址 | `0x80203000`  |
+| `la` 执行前 `sp`    | `0x80017ee0`  |
+| `la` 执行后 `sp`    | `0x80203000`  |
+| `tail` 执行前 PC    | `0x80200008`  |
+| `tail` 执行后 PC    | `0x8020000a`  |
+| `tail` 后所在函数   | `kern_init()` |
+
+因此，本次实验通过 GDB 对 `entry.S` 中两条关键指令进行了实际单步验证，并观察到了寄存器和程序计数器在执行前后的变化。
+
+---
+
+
+### 练习二
 1. **验证复位地址**：通过 `make gdb` 连接后，GDB 首行输出 `0x0000000000001000 in ?? ()`，并执行 `info registers pc` 确认 PC 值为 `0x1000`，证明 CPU 确实从复位向量开始执行。
 2. **验证跳转逻辑**：反汇编 `0x1000` 发现 `ld t0, 24(t0)` 配合 `jr t0`，并使用 `x/1gx 0x1018` 验证加载的值为 `0x80000000`，证明硬件复位后通过该指令序列跳入 OpenSBI。
 3. **验证内核加载与移交**：通过 `watch *0x80200000` 观察到内核被拷贝至 DRAM 的瞬间，随后使用 `b *0x80200000` 成功拦截，GDB 显示 `pc = 0x80200000`，完美验证了从 OpenSBI 到内核启动的完整流程。
