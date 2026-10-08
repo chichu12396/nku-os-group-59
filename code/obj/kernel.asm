@@ -18,34 +18,36 @@ tail kern_init
     80200008:	a009                	j	8020000a <kern_init>
 
 000000008020000a <kern_init>:
-#include <sbi.h>
 int kern_init(void) __attribute__((noreturn));
 
 int kern_init(void) {
-    extern char edata[], end[];
-    memset(edata, 0, end - edata);
+    extern char edata[], end[]; 
+    // 这里声明的两个符号由链接器定义，分别指向.data段结束和.bss段结束
+    memset(edata, 0, end - edata); 
     8020000a:	00003517          	auipc	a0,0x3
     8020000e:	ffe50513          	addi	a0,a0,-2 # 80203008 <edata>
     80200012:	00003617          	auipc	a2,0x3
     80200016:	ff660613          	addi	a2,a2,-10 # 80203008 <edata>
 int kern_init(void) {
     8020001a:	1141                	addi	sp,sp,-16
-    memset(edata, 0, end - edata);
+    memset(edata, 0, end - edata); 
     8020001c:	4581                	li	a1,0
     8020001e:	8e09                	sub	a2,a2,a0
 int kern_init(void) {
     80200020:	e406                	sd	ra,8(sp)
-    memset(edata, 0, end - edata);
+    memset(edata, 0, end - edata); 
     80200022:	08c000ef          	jal	ra,802000ae <memset>
+    // 清除.bss段：由于内核没有标准库，memset需要我们自己实现
 
     const char *message = "(THU.CST) os is loading ...\n";
-    cprintf("%s\n\n", message);
+    cprintf("%s\n\n", message); // cprintf是我们在ucore中自己实现的格式化输出函数
     80200026:	00000597          	auipc	a1,0x0
     8020002a:	4a258593          	addi	a1,a1,1186 # 802004c8 <sbi_console_putchar+0x1a>
     8020002e:	00000517          	auipc	a0,0x0
     80200032:	4ba50513          	addi	a0,a0,1210 # 802004e8 <sbi_console_putchar+0x3a>
     80200036:	020000ef          	jal	ra,80200056 <cprintf>
-   while (1)
+
+    while (1)
     8020003a:	a001                	j	8020003a <kern_init+0x30>
 
 000000008020003c <cputch>:
