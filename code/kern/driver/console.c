@@ -1,6 +1,6 @@
 #include <sbi.h>
 #include <console.h>
-//继续进行SBI 调用封装
+//继续进行SBI 调用封装（第1次）
 /* kbd_intr - try to feed input characters from keyboard */
 void kbd_intr(void) {}
 

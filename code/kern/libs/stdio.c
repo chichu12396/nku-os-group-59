@@ -1,7 +1,7 @@
 #include <console.h>
 #include <defs.h>
 #include <stdio.h>
-//SBI 继续调用封装，实现了ucore版本的puts函数: cputs()
+//SBI 继续调用封装，实现了ucore版本的puts函数: cputs()（第2次）
 
 /* HIGH level console I/O */
 

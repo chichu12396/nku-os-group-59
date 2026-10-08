@@ -1,4 +1,4 @@
-// libs/sbi.c SBI 调用封装
+// libs/sbi.c SBI 调用封装（第0次）
 #include <sbi.h>
 #include <defs.h>
 
