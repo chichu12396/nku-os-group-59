@@ -3,7 +3,30 @@
 #include <best_fit_pmm.h>
 #include <stdio.h>
 
-//lab2 function2-2 YOUR CODE
+//lab2 function2-2 2411033
+
+/*
+ * M0 临时骨架：让现有测试函数能够编译。
+ * 默认仍使用 First-Fit；M1 再实现 Best-Fit。
+ */
+static free_area_t free_area;
+
+#define free_list (free_area.free_list)
+#define nr_free   (free_area.nr_free)
+
+/* 提前声明下面已有的测试函数。 */
+static void best_fit_check(void);
+
+/* 防止误选尚未实现的 Best-Fit。 */
+static void best_fit_not_implemented(void) {
+    panic("Best-Fit is not implemented yet (M1)");
+}
+
+const struct pmm_manager best_fit_pmm_manager = {
+    .name = "best_fit_pmm_manager (not implemented)",
+    .init = best_fit_not_implemented,
+    .check = best_fit_check,
+};
 
 // Framework tests: students must not modify basic_check or best_fit_check.
 static void
