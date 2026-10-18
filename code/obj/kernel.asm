@@ -1102,21 +1102,21 @@ ffffffffc0200792:	b769                	j	ffffffffc020071c <pmm_init+0x128>
         panic("DTB memory does not cover the kernel memory layout");
 ffffffffc0200794:	00001617          	auipc	a2,0x1
 ffffffffc0200798:	2a460613          	addi	a2,a2,676 # ffffffffc0201a38 <etext+0x2b4>
-ffffffffc020079c:	06200593          	li	a1,98
+ffffffffc020079c:	06300593          	li	a1,99
 ffffffffc02007a0:	00001517          	auipc	a0,0x1
 ffffffffc02007a4:	28850513          	addi	a0,a0,648 # ffffffffc0201a28 <etext+0x2a4>
 ffffffffc02007a8:	a1bff0ef          	jal	ra,ffffffffc02001c2 <__panic>
         panic("invalid physical memory range from DTB");
 ffffffffc02007ac:	00001617          	auipc	a2,0x1
 ffffffffc02007b0:	25460613          	addi	a2,a2,596 # ffffffffc0201a00 <etext+0x27c>
-ffffffffc02007b4:	05c00593          	li	a1,92
+ffffffffc02007b4:	05d00593          	li	a1,93
 ffffffffc02007b8:	00001517          	auipc	a0,0x1
 ffffffffc02007bc:	27050513          	addi	a0,a0,624 # ffffffffc0201a28 <etext+0x2a4>
 ffffffffc02007c0:	a03ff0ef          	jal	ra,ffffffffc02001c2 <__panic>
         panic("not enough memory for physical page descriptors");
 ffffffffc02007c4:	00001617          	auipc	a2,0x1
 ffffffffc02007c8:	31c60613          	addi	a2,a2,796 # ffffffffc0201ae0 <etext+0x35c>
-ffffffffc02007cc:	07f00593          	li	a1,127
+ffffffffc02007cc:	08000593          	li	a1,128
 ffffffffc02007d0:	00001517          	auipc	a0,0x1
 ffffffffc02007d4:	25850513          	addi	a0,a0,600 # ffffffffc0201a28 <etext+0x2a4>
 ffffffffc02007d8:	9ebff0ef          	jal	ra,ffffffffc02001c2 <__panic>
@@ -1124,14 +1124,14 @@ ffffffffc02007d8:	9ebff0ef          	jal	ra,ffffffffc02001c2 <__panic>
 ffffffffc02007dc:	86ae                	mv	a3,a1
 ffffffffc02007de:	00001617          	auipc	a2,0x1
 ffffffffc02007e2:	2da60613          	addi	a2,a2,730 # ffffffffc0201ab8 <etext+0x334>
-ffffffffc02007e6:	0a900593          	li	a1,169
+ffffffffc02007e6:	0aa00593          	li	a1,170
 ffffffffc02007ea:	00001517          	auipc	a0,0x1
 ffffffffc02007ee:	23e50513          	addi	a0,a0,574 # ffffffffc0201a28 <etext+0x2a4>
 ffffffffc02007f2:	9d1ff0ef          	jal	ra,ffffffffc02001c2 <__panic>
     uintptr_t pages_pa = PADDR(pages);
 ffffffffc02007f6:	00001617          	auipc	a2,0x1
 ffffffffc02007fa:	2c260613          	addi	a2,a2,706 # ffffffffc0201ab8 <etext+0x334>
-ffffffffc02007fe:	07a00593          	li	a1,122
+ffffffffc02007fe:	07b00593          	li	a1,123
 ffffffffc0200802:	00001517          	auipc	a0,0x1
 ffffffffc0200806:	22650513          	addi	a0,a0,550 # ffffffffc0201a28 <etext+0x2a4>
 ffffffffc020080a:	9b9ff0ef          	jal	ra,ffffffffc02001c2 <__panic>
