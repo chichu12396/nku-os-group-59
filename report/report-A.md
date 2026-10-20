@@ -515,3 +515,200 @@ Total Score: 20/20
 
 这些实现与本实验具有相同的基本流程：
 即**固件或引导程序提供内存布局->操作系统读取地址范围和区域属性->保留已占用区域，将可用页面纳入内存管理**
+
+
+
+### 练习：对比分页前后的访存路径，理解 QEMU 软件 TLB 与真实 CPU TLB 的逻辑区别
+
+**负责人：** [学号-姓名]
+
+#### 1. 探究目标与方法
+
+本实验重点探究：
+
+> **QEMU 在 Bare 模式和 Sv39 模式下如何处理访存，以及其软件 TLB 与真实 CPU 的地址翻译 TLB 有什么逻辑区别。**
+
+实验选择两条写入指令进行对比，保持访问类型一致：
+
+| 情形 | 被调试的指令 | 写入地址 |
+|---|---|---|
+| **S 模式，Bare** | `kern_entry` 中的 `sd a0,0(t0)` | `0x80206000` |
+| **S 模式，Sv39** | `kern_init` 中的 `sd ra,8(sp)` | `0xffffffffc0204ff8` |
+
+调试采用两个 GDB：RISC-V GDB 控制 ucore 指令执行，普通 GDB 观察 QEMU 的地址处理和软件 TLB 填充过程。
+
+主要观察位置为：
+**riscv_cpu_tlb_fill()->get_physical_address()->tlb_set_page()**
+
+#### 2. Bare 模式：地址直接对应，仍然填充软件 TLB
+
+**探究内容：** 未开启虚拟地址翻译时，QEMU 是否仍使用软件 TLB。
+
+实验在 `riscv_cpu_tlb_fill` 设置 S 模式写访问断点：
+
+```gdb
+break riscv_cpu_tlb_fill if mmu_idx == 1 && access_type == MMU_DATA_STORE
+```
+
+执行 `kern_entry` 中的第一条 `sd` 后，断点捕获对 `0x80206000` 的写入。此时 `satp=0`，处于 Bare 模式。
+
+进入 `get_physical_address()` 后，代码采用直接地址处理：
+
+```c
+case VM_1_10_MBARE:
+    *physical = addr;
+    *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+    return TRANSLATE_SUCCESS;
+```
+
+执行赋值后，调试结果为：
+
+![Bare 模式地址相等](<./images/Bare 模式地址相等.png>)
+
+返回 `riscv_cpu_tlb_fill()` 后，日志记录代码继续执行：
+
+```text
+472    tlb_set_page(cs, address & TARGET_PAGE_MASK, pa & TARGET_PAGE_MASK,
+474    return true;
+```
+
+调用前的输出对应：
+
+```text
+address = 0x80206000
+pa      = 0x80206000
+satp    = 0x0
+```
+
+**结果说明：Bare 模式省去了页表翻译，但 QEMU 仍将处理结果填入软件 TLB。** 软件 TLB 的作用范围因此超出了客户机虚拟页到物理页的翻译。
+
+#### 3. 同页再次访问：复用已有的软件 TLB 映射
+
+**探究内容：** 第一次填充后，同页访问是否再次进入填充路径。
+
+实验继续执行第二条写入指令：
+
+```asm
+0x80200014: sd a1,0(t0)
+```
+
+两次写入地址分别为：
+
+```text
+第一次：0x80206000
+第二次：0x80206008
+```
+
+两者属于同一个 4 KiB 页：
+
+```text
+0x80206000 >> 12 = 0x80206
+0x80206008 >> 12 = 0x80206
+```
+
+第二次写入完成后，PC 到达 `0x80200018`，期间终端 2 的填充断点未再次触发。
+
+![同页第二次写入](<./images/同页第二次写入.png>)
+
+**结果说明：** 在两次访问之间没有执行 TLB 刷新的情况下，第二次同页写入完成且未再次进入填充路径，与复用已有软件 TLB 映射的行为一致。
+
+#### 4. Sv39 模式：先查询页表，再填充软件 TLB
+
+**探究内容：** 开启分页后，同类写访问在填充 TLB 之前增加了哪些处理。
+
+实验连续执行启动代码，到达高地址 `kern_init` 后，选择栈写入指令：
+
+```asm
+0xffffffffc02000ee: sd ra,8(sp)
+```
+
+计算有效地址：
+
+```gdb
+p/x $sp + 8
+```
+
+结果为：
+
+![分页后的实际指令](<./images/分页后的实际指令.png>)
+
+在 QEMU 断点处检查访问参数和分页状态：
+
+```gdb
+p/x address
+p access_type
+p/x $e->satp
+p/x ($e->satp >> 60)
+```
+
+结果为：
+其中模式字段为 8，表明本次访问使用 **Sv39 地址翻译**。
+
+![Sv39 状态](<./images/Sv39 状态.png>)
+
+进入 `get_physical_address()`，执行到页表项读取完成后，得到：
+
+![页表查询结果](<./images/页表查询结果.png>)
+
+本实验的启动页表在根级设置了大页叶子项，因此本次查询在第一轮就取得映射。
+
+函数返回后的日志记录：
+
+```text
+Value returned is $13 = 0
+$14 = 0xffffffffc0204ff8
+$15 = 0x80204000
+```
+
+其中，返回值 0 表示翻译成功，`0x80204000` 是物理页基址。加上原地址的页内偏移，可得实际写入地址：
+
+```text
+0x80204000 + 0xff8 = 0x80204ff8
+```
+
+随后，代码同样执行 `tlb_set_page()` 并返回成功。
+
+**结果说明：Sv39 模式在软件 TLB 填充前增加了页表查询和权限等检查，成功后仍使用同一套软件 TLB 填充接口。**
+
+#### 5. 调用路径与软件 TLB 保存的信息
+
+日志中的写访问调用栈包含：
+**code_gen_buffer->helper_le_stq_mmu->store_helper->tlb_fill->riscv_cpu_tlb_fill**
+
+本次两种模式下，实验都观察到 `riscv_cpu_tlb_fill()` 调用 `get_physical_address()`，成功后执行 `tlb_set_page()`。**区别集中在地址处理函数内部：Bare 直接对应地址，Sv39 查询页表取得映射。**
+
+为了说明软件 TLB 的用途，实验进一步查看 `CPUTLBEntry` 定义：
+
+```c
+target_ulong addr_read;
+target_ulong addr_write;
+target_ulong addr_code;
+uintptr_t addend;
+```
+
+![软件 TLB 结构](<./images/软件 TLB 结构.png>)
+
+前三个字段保存读、写和取指访问的地址标记及相关标志。源码对 `addend` 的注释为：
+
+```c
+/* Addend to virtual address to get host address. */
+```
+
+对于适用的 RAM 快速访问路径，其地址计算可以概括为：
+
+```text
+宿主机地址 = 客户机虚拟地址 + addend
+```
+
+**这说明 QEMU 软件 TLB 还保存了定位宿主机内存所需的信息。** 它服务于模拟器执行客户机访存指令的整个过程。
+
+#### 6. QEMU 软件 TLB 与真实 CPU TLB 的逻辑区别
+
+| 对比内容 | 真实 CPU 的地址翻译 TLB | 本实验中的 QEMU 软件 TLB |
+|---|---|---|
+| **主要用途** | 加速虚拟地址到物理地址的翻译及权限检查 | 加速客户机访存，包括地址翻译结果与宿主机内存定位 |
+| **Bare 模式** | S 模式 Bare 访问直接采用物理地址，省去分页翻译 | 直接取得物理地址后，仍调用软件 TLB 填充接口 |
+| **缓存信息** | 虚拟页与物理页的映射、权限等属性 | 读、写、取指标记，以及计算宿主机地址的 `addend` 等 |
+| **分页开启后的共同点** | 利用缓存映射减少重复翻译 | 利用缓存结果减少重复的翻译与访存处理 |
+
+**本次实验表明，QEMU 软件 TLB 的逻辑角色覆盖了模拟器的访存加速。** Bare 与 Sv39 两种模式都会使用它；分页是否开启，主要改变填充之前取得物理地址的过程。`addend` 则体现了软件模拟环境特有的客户机地址与宿主机地址之间的联系。
