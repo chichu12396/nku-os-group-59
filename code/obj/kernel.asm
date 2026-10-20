@@ -875,7 +875,7 @@ ffffffffc02005f0:	779c                	ld	a5,40(a5)
 ffffffffc02005f2:	8782                	jr	a5
 
 ffffffffc02005f4 <pmm_init>:
-    pmm_manager = &default_pmm_manager;
+    // pmm_manager = &default_pmm_manager;
 ffffffffc02005f4:	00002797          	auipc	a5,0x2
 ffffffffc02005f8:	96c78793          	addi	a5,a5,-1684 # ffffffffc0201f60 <default_pmm_manager>
     cprintf("memory management: %s\n", pmm_manager->name);
@@ -891,7 +891,7 @@ ffffffffc0200600:	f022                	sd	s0,32(sp)
     cprintf("memory management: %s\n", pmm_manager->name);
 ffffffffc0200602:	00001517          	auipc	a0,0x1
 ffffffffc0200606:	3e650513          	addi	a0,a0,998 # ffffffffc02019e8 <etext+0x264>
-    pmm_manager = &default_pmm_manager;
+    // pmm_manager = &default_pmm_manager;
 ffffffffc020060a:	00006417          	auipc	s0,0x6
 ffffffffc020060e:	a4e40413          	addi	s0,s0,-1458 # ffffffffc0206058 <pmm_manager>
 {
@@ -900,7 +900,7 @@ ffffffffc0200614:	e84a                	sd	s2,16(sp)
 ffffffffc0200616:	ec26                	sd	s1,24(sp)
 ffffffffc0200618:	e44e                	sd	s3,8(sp)
 ffffffffc020061a:	e052                	sd	s4,0(sp)
-    pmm_manager = &default_pmm_manager;
+    // pmm_manager = &default_pmm_manager;
 ffffffffc020061c:	e01c                	sd	a5,0(s0)
     cprintf("memory management: %s\n", pmm_manager->name);
 ffffffffc020061e:	b2fff0ef          	jal	ra,ffffffffc020014c <cprintf>
