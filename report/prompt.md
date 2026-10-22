@@ -492,7 +492,7 @@ kernel panic at kern/mm/buddy_pmm.c:241:
 
 ---
 
-### Challenge：任意大小的内存单元 SLUB 分配算法（成员 C）
+### 功能模块：任意大小的内存单元 SLUB 分配算法
 
 **负责人：** 2413346-易响
 
