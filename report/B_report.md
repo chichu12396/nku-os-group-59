@@ -520,13 +520,10 @@ riscv_cpu_tlb_fill address=ffffffffc02000d8 ret 0 physical 0000000080200000 prot
 
 #### 五、细节部分
 
-1. **为什么必须用 QEMU 4.1.1：一个"被修掉的旧行为"救了这套启动代码。**
-   `entry.S` 启用 Sv39 时，PC 还停在物理地址 `0x80200000`，而启动页表只映射了 `0xFFFFFFFFC0000000` 起的 1GB，**低半区没有映射**。这段代码之所以能跑完并 `jr` 到虚拟地址，靠的是 QEMU 4.1.1 的 `write_satp()`（`target/riscv/csr.c:729`）**只在 ASID 变化时才 `tlb_flush`**：本例中 ASID 前后都是 0，于是 bare 模式下建立的旧 TLB 映射被继续复用，几条指令取完才跳到虚拟地址。
-   新版 QEMU 把这里改成了**无条件刷 TLB**——7.0 的源码注释写得很直白：*"Flushing the TLB on SATP writes with paging enabled avoids leaking those invalid cached mappings."* 这个"修 bug"恰好修掉了本 lab 赖以工作的旧行为，于是 `csrw satp` 之后在 `0x80200000` 上的取指立刻变成未映射的取指页错误（`-d int` 里表现为同一条 `exec_page_fault` 无限循环），内核完全起不来。
-   *（这条与 ⑤ 丙"QEMU 的 TLB 与真实 CPU 的 TLB 在逻辑上的区别"直接相关，可作为 A 那部分的素材。）*
-2. **1GB 大页与"伪造的叶 PTE"。** 启动页表把整个 1GB 空间塞进一个 PTE，所以本实验的启动阶段只用到三级遍历中的第一级；`cpu_helper.c:331-334` 用 `(ppn | (vpn & ((1 << ptshift) - 1))) << 12` 把虚拟地址的低位并回物理地址——这解释了为什么 `-d mmu` 日志里的 `physical` 总是页对齐的。
-3. **`mmu_idx` 就是特权级。** `target/riscv/cpu.h:273` 把 `cpu_mmu_index` 重定向到 `riscv_cpu_mmu_index`，而它返回 `env->priv`；这个值还会进入 TB 的 flags（`cpu_get_tb_cpu_state`，`cpu.h:293-303`），也就是说**特权级是翻译块的键的一部分**。用它可以给 `-d mmu` 日志分段：M 模式（OpenSBI）54 条、S 模式（内核）454 条。
-4. **PTE 的 A/D 位由 QEMU 软件更新，而且更新失败会导致重新遍历。** `cpu_helper.c:289-329` 在需要时用 `atomic_cmpxchg` 原子地把 `PTE_A`（以及 store 时的 `PTE_D`）写回内存；如果 CAS 失败（说明别的 vCPU 改过），会 `goto restart` **重新走一遍页表**。真实硬件上这一步是 MMU 自动完成的，软件看不到。
+
+1. **1GB 大页与"伪造的叶 PTE"。** 启动页表把整个 1GB 空间塞进一个 PTE，所以本实验的启动阶段只用到三级遍历中的第一级；`cpu_helper.c:331-334` 用 `(ppn | (vpn & ((1 << ptshift) - 1))) << 12` 把虚拟地址的低位并回物理地址——这解释了为什么 `-d mmu` 日志里的 `physical` 总是页对齐的。
+2. **`mmu_idx` 就是特权级。** `target/riscv/cpu.h:273` 把 `cpu_mmu_index` 重定向到 `riscv_cpu_mmu_index`，而它返回 `env->priv`；这个值还会进入 TB 的 flags（`cpu_get_tb_cpu_state`，`cpu.h:293-303`），也就是说**特权级是翻译块的键的一部分**。用它可以给 `-d mmu` 日志分段：M 模式（OpenSBI）54 条、S 模式（内核）454 条。
+3. **PTE 的 A/D 位由 QEMU 软件更新，而且更新失败会导致重新遍历。** `cpu_helper.c:289-329` 在需要时用 `atomic_cmpxchg` 原子地把 `PTE_A`（以及 store 时的 `PTE_D`）写回内存；如果 CAS 失败（说明别的 vCPU 改过），会 `goto restart` **重新走一遍页表**。真实硬件上这一步是 MMU 自动完成的，软件看不到。
 
 ---
 
