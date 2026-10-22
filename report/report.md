@@ -877,6 +877,155 @@ kernel panic at kern/mm/buddy_pmm.c:241:
 ---
 
 
+### 功能模块：任意大小的内存单元 SLUB 分配算法
+
+**负责人：** 2413346-易响
+
+#### 模块功能描述
+
+| 文件 | 内容 |
+|---|---|
+| `kern/mm/slub.h` | 对外接口声明 |
+| `kern/mm/slub.c` | 两层简化 SLUB 实现 + 自检 `slub_check()` |
+
+```c
+void  slub_init(void);            // 初始化 10 个大小类缓存
+void  slub_check(void);           // 自检，由 pmm_init() 在 LAB2_SLUB 下调用
+void *slub_alloc(size_t size);    // 任意大小分配，失败返回 NULL
+void  slub_free(void *ptr);       // 释放，非法指针只告警不破坏结构
+```
+
+接入方式：A 已在 `kern/mm/pmm.c` 的 `pmm_init()` 中写好
+
+```c
+#ifdef LAB2_SLUB
+    slub_init();
+    slub_check();
+#endif
+```
+
+因此本模块不需要修改 `pmm.c`，也不依赖具体页分配器（只调用 `alloc_pages/free_pages`）。
+
+
+#### 1. 设计说明：为什么"固定大小类"就是"任意大小分配"
+
+##### 1.1 SLUB 的两层架构决定了对象大小必须固定
+
+第一层是页级分配（`alloc_pages/free_pages`），一次给整页；第二层在页内按**固定步长**把页切成等长对象，用空闲对象链表（freelist）串起来。只有步长固定，才能：
+
+- 用"页内偏移 = 对象下标 × 步长"直接算出任意对象地址，不需要额外元数据；
+- 用空闲对象自己的前 8 字节存 freepointer，零额外开销；
+- 分配和释放都是 O(1)（弹出/压入链表），这正是 SLUB"低开销"的本质。
+
+如果改成"每块按请求字节数精确切分"，就必须给每个对象加头部记录长度、需要扫描找空闲块，SLUB 的全部优点都不复存在——那是通用堆分配器，不是 SLUB。
+
+##### 1.2 "任意大小"由大小类向上取整来服务
+
+这是 Linux 内核 `mm/slub.c` 的实际做法：`kmem_cache` 的 `object_size` 固定，`kmalloc()` 这个"任意大小"接口把请求向上取整到最近的 kmalloc 缓存（8、16、32、…、8k）。我们照搬这套：
+
+| 请求大小 | 大小类 | 步长 | 每页对象数 |
+|---|---|---|---|
+| 1 ~ 8 | 8 | 8 | 512 |
+| 9 ~ 16 | 16 | 16 | 256 |
+| 17 ~ 32 | 32 | 32 | 128 |
+| 33 ~ 64 | 64 | 64 | 64 |
+| 65 ~ 128 | 128 | 128 | 32 |
+| 129 ~ 256 | 256 | 256 | 16 |
+| 257 ~ 512 | 512 | 512 | 8 |
+| 513 ~ 1024 | 1024 | 1024 | 4 |
+| 1025 ~ 2048 | 2048 | 2048 | 2 |
+| 2049 ~ 4096 | 4096 | 4096 | 1 |
+
+因此从调用者角度看，`slub_alloc(size)` 对 1~4096 的**任意** `size` 都可用，只是内部按大小类近似。代价是内部碎片（例如请求 100 字节实际占 128 字节），换来 O(1) 分配/释放与复用。
+
+##### 1.3 为什么上限是 4096，以及"简化"的边界
+
+指导书对本任务的要求是"**可简化实现，能够体现其主体思想即可**"。本实现把缓存限制在一页以内：`size > PGSIZE` 返回 `NULL`。这样做的好处是实现简单、可完全验证；代价是不支持超过一页的对象（Linux 的 kmalloc 会继续用 order-1/2/3 的多页 slab 支持 8K/16K/32K，属于可选扩展方向）。在"两层架构 + 固定对象大小 + freelist 复用"这个主体思想上，本实现是完整且自洽的。
+
+##### 1.4 与 Linux SLUB 的对应关系
+
+| Linux SLUB 机制 | 本实现的简化版 |
+|---|---|
+| `struct kmem_cache`（每大小一个缓存） | `struct slub_cache`：步长、每页对象数、current、partial 链表 |
+| `struct slab`（页的元数据） | `struct slub_slab`：freelist、inuse、objects、所属桶 |
+| `calculate_sizes()`（算布局） | 步长 = 大小类，对象数 = `PGSIZE / 步长` |
+| `new_slab()`（伙伴系统取页） | `alloc_pages(1)` 取一页并串 freelist |
+| `___slab_alloc` 快/慢路径 | 当前 slab → partial 链表 → 新建 slab 三级 |
+| `__slab_free` / `free_slab` | 压回 freelist；非当前 slab 且空则整页归还 |
+| kmalloc 固定大小缓存 | 10 个 2 的幂大小类 |
+| 砍掉：锁、per-cpu sheaf、NUMA、RCU、redzone/poison 等 | 单线程实验不需要 |
+
+
+**最终提示词：** 见 [`prompt.md`](./prompt.md) 第 1、2 节（实现与测试两份提示词）。
+
+#### 实现迭代过程
+
+#### 4.1 `Page.property` 与页分配器的复用冲突（关键）
+
+问题：SLUB 需要"由任意对象指针反查所属 slab"。内核没有 `KADDR`（`pmm.h` 里被注释掉了），只能通过 `pa2page(pa)` 拿页描述符。而 `struct Page` 里唯一可自由使用的整型字段是 `property`。
+
+风险：`property` 同时被页分配器当作空闲块大小使用——`alloc_pages` 返回后它可能残留旧值，`free_pages` 又要求 `PG_property` 位必须为 0。
+
+解决：
+1. `slab_build()` 里在取到页后立即写 `page->property = slab 下标 + 1`，并 `ClearPageProperty(page)`；
+2. 归还页面前**先** `page->flags = 0; page->property = 0;`，再 `free_page()`；
+3. `slub_free()` 里做三重校验（页描述符一致、页基址一致、桶号有效），防止陈旧的 `property` 恰好指向一个已被回收复用的 slab。
+
+#### 4.2 空 slab 的回收时机
+
+初版设计里还保留了"当前 slab 变空时也尝试回收"的分支，实现后发现该分支不可达：`cache->current` 只会在"已满（freelist 为空）"时才被替换，而变空的 slab 一定还是 current，下次分配会直接复用。删掉死代码后逻辑更清晰：**非当前 slab 变空就整页归还，当前 slab 永远保留作缓存**。
+
+#### 4.3 4096 桶（一页一个对象）的边界
+
+`4096` 桶的 `objects == 1`，此时 freelist 只有 1 个节点。初版测试没有区分"分配失败"和"对象已被占满"两种情况，容易在跨 slab 测试里误判。最终用"每页对象数 = `PGSIZE / stride`"统一处理，并单独加了整页对象的分配/释放/再分配测试。
+
+#### 4.4 页数守恒的预期值
+
+`slub_check()` 结束时 `delta = 基线 − 当前` 必须等于**用到的桶数**（每个缓存保留 1 页 current 作缓存）。第一版测试只断言"页数不变"，但跨桶测试会合法地多占页，导致误报。改为"`delta ≤ 桶数` 且打印具体值"后既严格又不误伤。
+
+
+---
+
+#### 测试覆盖与有效性说明
+
+| # | 测试 | 覆盖的核心行为 / 边界情况 | 为什么能有效检验 |
+|---|---|---|---|
+| 1 | 全大小类 1~4096 | 桶切换点（7→8、8→8、9→16）、非 2 的幂、4096 上界、8 字节对齐、整块读写 | 边界值取在桶切换处，能抓向上取整错误；每个对象写满 `size` 字节再读回，能抓越界或对象重叠 |
+| 2 | 64×128B 同时存活 | 多对象并存、跨 2 个 slab | 超过单页 32 个对象，必然触发新 slab，检验 slab 间独立 |
+| 3 | 700×8B 跨 slab | freelist 跨页衔接、对象不重叠 | 每个对象写 64 位唯一值，链表断链或对象重叠都会破坏内容 |
+| 4 | 200 轮分配/释放 | 对象复用、空 slab 回收、页数不增长 | 页数必须严格相等，能抓"每轮新建 slab"或"释放不还页" |
+| 5 | 交叉大小乱序释放 | 桶间隔离、乱序 free 不破坏存活对象 | 先释放中间对象再校验幸存者，能抓跨桶指针混淆 |
+| 6 | 4096 整页对象 | 上界单对象页、页对齐、释放后复用 | 校验 4096 对齐与整页读写，能抓 4096 桶步长/对象数错误 |
+| 7 | 非法输入 | `size=0`、`>PGSIZE`、`free(NULL)` | 检验参数校验与防御路径，保证不破坏状态 |
+| 8 | 页数守恒 | 全部释放后页数回到基线 + 缓存页 | 全局泄漏不变量：`delta` 恰好等于用到的桶数（10），多泄漏一页即失败 |
+
+有效性小结：测试同时从**内容维度**（逐字节模式校验，抓重叠/链表破坏）、**数量维度**（对象数/页数守恒，抓泄漏）、**边界维度**（桶切换点、单页上限、非法输入）三个方向覆盖；任何一类错误都会触发 `panic` 并打印是哪项测试失败，便于定位。
+
+
+---
+
+#### 运行输出
+
+```
+memory management: best_fit_pmm_manager
+check_alloc_page() succeeded!
+[SLUB] slub_check start, size classes 8..4096
+[SLUB] size classes 1..4096, alignment and content: passed
+[SLUB] 64 x 128B objects across two slabs: passed
+[SLUB] 700 x 8B objects crossing a slab boundary: passed
+[SLUB] 200 alloc/free cycles without page growth: passed
+[SLUB] cross size isolation with reordered frees: passed
+[SLUB] whole-page object (4096) alloc/free/realloc: passed
+[SLUB] invalid requests (0, >PGSIZE, NULL free): passed
+[SLUB] page conservation: base=31920 now=31910 delta=10 (<= 10)
+[SLUB] page conservation after releasing everything: passed
+SLUB check passed!
+```
+
+默认构建（不定义 `LAB2_SLUB`）下模块只编译不运行，`make grade` 仍为 20/20。
+
+---
+
 ### 练习：GDB 调试 QEMU（甲：调用路径与页表遍历）
 
 **负责人：** 2412102-聂海丽
@@ -1114,13 +1263,13 @@ riscv_cpu_tlb_fill address=ffffffffc02000d8 ret 0 physical 0000000080200000 prot
 
 #### 五、细节部分
 
-1. **为什么必须用 QEMU 4.1.1：一个"被修掉的旧行为"救了这套启动代码。**
+<!-- 1. **为什么必须用 QEMU 4.1.1：一个"被修掉的旧行为"救了这套启动代码。**
    `entry.S` 启用 Sv39 时，PC 还停在物理地址 `0x80200000`，而启动页表只映射了 `0xFFFFFFFFC0000000` 起的 1GB，**低半区没有映射**。这段代码之所以能跑完并 `jr` 到虚拟地址，靠的是 QEMU 4.1.1 的 `write_satp()`（`target/riscv/csr.c:729`）**只在 ASID 变化时才 `tlb_flush`**：本例中 ASID 前后都是 0，于是 bare 模式下建立的旧 TLB 映射被继续复用，几条指令取完才跳到虚拟地址。
    新版 QEMU 把这里改成了**无条件刷 TLB**——7.0 的源码注释写得很直白：*"Flushing the TLB on SATP writes with paging enabled avoids leaking those invalid cached mappings."* 这个"修 bug"恰好修掉了本 lab 赖以工作的旧行为，于是 `csrw satp` 之后在 `0x80200000` 上的取指立刻变成未映射的取指页错误（`-d int` 里表现为同一条 `exec_page_fault` 无限循环），内核完全起不来。
-   *（这条与 ⑤ 丙"QEMU 的 TLB 与真实 CPU 的 TLB 在逻辑上的区别"直接相关，可作为 A 那部分的素材。）*
-2. **1GB 大页与"伪造的叶 PTE"。** 启动页表把整个 1GB 空间塞进一个 PTE，所以本实验的启动阶段只用到三级遍历中的第一级；`cpu_helper.c:331-334` 用 `(ppn | (vpn & ((1 << ptshift) - 1))) << 12` 把虚拟地址的低位并回物理地址——这解释了为什么 `-d mmu` 日志里的 `physical` 总是页对齐的。
-3. **`mmu_idx` 就是特权级。** `target/riscv/cpu.h:273` 把 `cpu_mmu_index` 重定向到 `riscv_cpu_mmu_index`，而它返回 `env->priv`；这个值还会进入 TB 的 flags（`cpu_get_tb_cpu_state`，`cpu.h:293-303`），也就是说**特权级是翻译块的键的一部分**。用它可以给 `-d mmu` 日志分段：M 模式（OpenSBI）54 条、S 模式（内核）454 条。
-4. **PTE 的 A/D 位由 QEMU 软件更新，而且更新失败会导致重新遍历。** `cpu_helper.c:289-329` 在需要时用 `atomic_cmpxchg` 原子地把 `PTE_A`（以及 store 时的 `PTE_D`）写回内存；如果 CAS 失败（说明别的 vCPU 改过），会 `goto restart` **重新走一遍页表**。真实硬件上这一步是 MMU 自动完成的，软件看不到。
+   *（这条与 ⑤ 丙"QEMU 的 TLB 与真实 CPU 的 TLB 在逻辑上的区别"直接相关，可作为 A 那部分的素材。）* -->
+1. **1GB 大页与"伪造的叶 PTE"。** 启动页表把整个 1GB 空间塞进一个 PTE，所以本实验的启动阶段只用到三级遍历中的第一级；`cpu_helper.c:331-334` 用 `(ppn | (vpn & ((1 << ptshift) - 1))) << 12` 把虚拟地址的低位并回物理地址——这解释了为什么 `-d mmu` 日志里的 `physical` 总是页对齐的。
+2. **`mmu_idx` 就是特权级。** `target/riscv/cpu.h:273` 把 `cpu_mmu_index` 重定向到 `riscv_cpu_mmu_index`，而它返回 `env->priv`；这个值还会进入 TB 的 flags（`cpu_get_tb_cpu_state`，`cpu.h:293-303`），也就是说**特权级是翻译块的键的一部分**。用它可以给 `-d mmu` 日志分段：M 模式（OpenSBI）54 条、S 模式（内核）454 条。
+3. **PTE 的 A/D 位由 QEMU 软件更新，而且更新失败会导致重新遍历。** `cpu_helper.c:289-329` 在需要时用 `atomic_cmpxchg` 原子地把 `PTE_A`（以及 store 时的 `PTE_D`）写回内存；如果 CAS 失败（说明别的 vCPU 改过），会 `goto restart` **重新走一遍页表**。真实硬件上这一步是 MMU 自动完成的，软件看不到。
 
 ---
 
@@ -1521,156 +1670,6 @@ uintptr_t addend;
 
 
 
-### 练习：任意大小的内存单元 SLUB 分配算法
-
-**负责人：** 2413346-易响
-
-#### 模块功能描述
-
-| 文件 | 内容 |
-|---|---|
-| `kern/mm/slub.h` | 对外接口声明 |
-| `kern/mm/slub.c` | 两层简化 SLUB 实现 + 自检 `slub_check()` |
-
-```c
-void  slub_init(void);            // 初始化 10 个大小类缓存
-void  slub_check(void);           // 自检，由 pmm_init() 在 LAB2_SLUB 下调用
-void *slub_alloc(size_t size);    // 任意大小分配，失败返回 NULL
-void  slub_free(void *ptr);       // 释放，非法指针只告警不破坏结构
-```
-
-接入方式：A 已在 `kern/mm/pmm.c` 的 `pmm_init()` 中写好
-
-```c
-#ifdef LAB2_SLUB
-    slub_init();
-    slub_check();
-#endif
-```
-
-因此本模块不需要修改 `pmm.c`，也不依赖具体页分配器（只调用 `alloc_pages/free_pages`）。
-
-
-#### 1. 设计说明：为什么"固定大小类"就是"任意大小分配"
-
-##### 1.1 SLUB 的两层架构决定了对象大小必须固定
-
-第一层是页级分配（`alloc_pages/free_pages`），一次给整页；第二层在页内按**固定步长**把页切成等长对象，用空闲对象链表（freelist）串起来。只有步长固定，才能：
-
-- 用"页内偏移 = 对象下标 × 步长"直接算出任意对象地址，不需要额外元数据；
-- 用空闲对象自己的前 8 字节存 freepointer，零额外开销；
-- 分配和释放都是 O(1)（弹出/压入链表），这正是 SLUB"低开销"的本质。
-
-如果改成"每块按请求字节数精确切分"，就必须给每个对象加头部记录长度、需要扫描找空闲块，SLUB 的全部优点都不复存在——那是通用堆分配器，不是 SLUB。
-
-##### 1.2 "任意大小"由大小类向上取整来服务
-
-这是 Linux 内核 `mm/slub.c` 的实际做法：`kmem_cache` 的 `object_size` 固定，`kmalloc()` 这个"任意大小"接口把请求向上取整到最近的 kmalloc 缓存（8、16、32、…、8k）。我们照搬这套：
-
-| 请求大小 | 大小类 | 步长 | 每页对象数 |
-|---|---|---|---|
-| 1 ~ 8 | 8 | 8 | 512 |
-| 9 ~ 16 | 16 | 16 | 256 |
-| 17 ~ 32 | 32 | 32 | 128 |
-| 33 ~ 64 | 64 | 64 | 64 |
-| 65 ~ 128 | 128 | 128 | 32 |
-| 129 ~ 256 | 256 | 256 | 16 |
-| 257 ~ 512 | 512 | 512 | 8 |
-| 513 ~ 1024 | 1024 | 1024 | 4 |
-| 1025 ~ 2048 | 2048 | 2048 | 2 |
-| 2049 ~ 4096 | 4096 | 4096 | 1 |
-
-因此从调用者角度看，`slub_alloc(size)` 对 1~4096 的**任意** `size` 都可用，只是内部按大小类近似。代价是内部碎片（例如请求 100 字节实际占 128 字节），换来 O(1) 分配/释放与复用。
-
-##### 1.3 为什么上限是 4096，以及"简化"的边界
-
-指导书对本任务的要求是"**可简化实现，能够体现其主体思想即可**"。本实现把缓存限制在一页以内：`size > PGSIZE` 返回 `NULL`。这样做的好处是实现简单、可完全验证；代价是不支持超过一页的对象（Linux 的 kmalloc 会继续用 order-1/2/3 的多页 slab 支持 8K/16K/32K，属于可选扩展方向）。在"两层架构 + 固定对象大小 + freelist 复用"这个主体思想上，本实现是完整且自洽的。
-
-##### 1.4 与 Linux SLUB 的对应关系
-
-| Linux SLUB 机制 | 本实现的简化版 |
-|---|---|
-| `struct kmem_cache`（每大小一个缓存） | `struct slub_cache`：步长、每页对象数、current、partial 链表 |
-| `struct slab`（页的元数据） | `struct slub_slab`：freelist、inuse、objects、所属桶 |
-| `calculate_sizes()`（算布局） | 步长 = 大小类，对象数 = `PGSIZE / 步长` |
-| `new_slab()`（伙伴系统取页） | `alloc_pages(1)` 取一页并串 freelist |
-| `___slab_alloc` 快/慢路径 | 当前 slab → partial 链表 → 新建 slab 三级 |
-| `__slab_free` / `free_slab` | 压回 freelist；非当前 slab 且空则整页归还 |
-| kmalloc 固定大小缓存 | 10 个 2 的幂大小类 |
-| 砍掉：锁、per-cpu sheaf、NUMA、RCU、redzone/poison 等 | 单线程实验不需要 |
-
-
-**最终提示词：** 见 [`prompt.md`](./prompt.md) 第 1、2 节（实现与测试两份提示词）。
-
-#### 实现迭代过程
-
-#### 4.1 `Page.property` 与页分配器的复用冲突（关键）
-
-问题：SLUB 需要"由任意对象指针反查所属 slab"。内核没有 `KADDR`（`pmm.h` 里被注释掉了），只能通过 `pa2page(pa)` 拿页描述符。而 `struct Page` 里唯一可自由使用的整型字段是 `property`。
-
-风险：`property` 同时被页分配器当作空闲块大小使用——`alloc_pages` 返回后它可能残留旧值，`free_pages` 又要求 `PG_property` 位必须为 0。
-
-解决：
-1. `slab_build()` 里在取到页后立即写 `page->property = slab 下标 + 1`，并 `ClearPageProperty(page)`；
-2. 归还页面前**先** `page->flags = 0; page->property = 0;`，再 `free_page()`；
-3. `slub_free()` 里做三重校验（页描述符一致、页基址一致、桶号有效），防止陈旧的 `property` 恰好指向一个已被回收复用的 slab。
-
-#### 4.2 空 slab 的回收时机
-
-初版设计里还保留了"当前 slab 变空时也尝试回收"的分支，实现后发现该分支不可达：`cache->current` 只会在"已满（freelist 为空）"时才被替换，而变空的 slab 一定还是 current，下次分配会直接复用。删掉死代码后逻辑更清晰：**非当前 slab 变空就整页归还，当前 slab 永远保留作缓存**。
-
-#### 4.3 4096 桶（一页一个对象）的边界
-
-`4096` 桶的 `objects == 1`，此时 freelist 只有 1 个节点。初版测试没有区分"分配失败"和"对象已被占满"两种情况，容易在跨 slab 测试里误判。最终用"每页对象数 = `PGSIZE / stride`"统一处理，并单独加了整页对象的分配/释放/再分配测试。
-
-#### 4.4 页数守恒的预期值
-
-`slub_check()` 结束时 `delta = 基线 − 当前` 必须等于**用到的桶数**（每个缓存保留 1 页 current 作缓存）。第一版测试只断言"页数不变"，但跨桶测试会合法地多占页，导致误报。改为"`delta ≤ 桶数` 且打印具体值"后既严格又不误伤。
-
-
----
-
-#### 测试覆盖与有效性说明
-
-| # | 测试 | 覆盖的核心行为 / 边界情况 | 为什么能有效检验 |
-|---|---|---|---|
-| 1 | 全大小类 1~4096 | 桶切换点（7→8、8→8、9→16）、非 2 的幂、4096 上界、8 字节对齐、整块读写 | 边界值取在桶切换处，能抓向上取整错误；每个对象写满 `size` 字节再读回，能抓越界或对象重叠 |
-| 2 | 64×128B 同时存活 | 多对象并存、跨 2 个 slab | 超过单页 32 个对象，必然触发新 slab，检验 slab 间独立 |
-| 3 | 700×8B 跨 slab | freelist 跨页衔接、对象不重叠 | 每个对象写 64 位唯一值，链表断链或对象重叠都会破坏内容 |
-| 4 | 200 轮分配/释放 | 对象复用、空 slab 回收、页数不增长 | 页数必须严格相等，能抓"每轮新建 slab"或"释放不还页" |
-| 5 | 交叉大小乱序释放 | 桶间隔离、乱序 free 不破坏存活对象 | 先释放中间对象再校验幸存者，能抓跨桶指针混淆 |
-| 6 | 4096 整页对象 | 上界单对象页、页对齐、释放后复用 | 校验 4096 对齐与整页读写，能抓 4096 桶步长/对象数错误 |
-| 7 | 非法输入 | `size=0`、`>PGSIZE`、`free(NULL)` | 检验参数校验与防御路径，保证不破坏状态 |
-| 8 | 页数守恒 | 全部释放后页数回到基线 + 缓存页 | 全局泄漏不变量：`delta` 恰好等于用到的桶数（10），多泄漏一页即失败 |
-
-有效性小结：测试同时从**内容维度**（逐字节模式校验，抓重叠/链表破坏）、**数量维度**（对象数/页数守恒，抓泄漏）、**边界维度**（桶切换点、单页上限、非法输入）三个方向覆盖；任何一类错误都会触发 `panic` 并打印是哪项测试失败，便于定位。
-
-
----
-
-#### 运行输出
-
-```
-memory management: best_fit_pmm_manager
-check_alloc_page() succeeded!
-[SLUB] slub_check start, size classes 8..4096
-[SLUB] size classes 1..4096, alignment and content: passed
-[SLUB] 64 x 128B objects across two slabs: passed
-[SLUB] 700 x 8B objects crossing a slab boundary: passed
-[SLUB] 200 alloc/free cycles without page growth: passed
-[SLUB] cross size isolation with reordered frees: passed
-[SLUB] whole-page object (4096) alloc/free/realloc: passed
-[SLUB] invalid requests (0, >PGSIZE, NULL free): passed
-[SLUB] page conservation: base=31920 now=31910 delta=10 (<= 10)
-[SLUB] page conservation after releasing everything: passed
-SLUB check passed!
-```
-
-默认构建（不定义 `LAB2_SLUB`）下模块只编译不运行，`make grade` 仍为 20/20。
-
----
-
----
 
 ## 五、测试与验证
 
