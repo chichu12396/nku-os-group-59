@@ -85,14 +85,14 @@ static void page_init(void)
     extern char end[];
 
     // 1. DTB reports physical addresses; its end is an exclusive bound.
-    uint64_t mem_base = get_memory_base();
-    uint64_t mem_size = get_memory_size();
+    uint64_t mem_base = get_memory_base();    //0x80000000
+    uint64_t mem_size = get_memory_size();    //0x8000000
     if (mem_base == 0 || mem_size == 0 ||
         mem_size > (uint64_t)-1 - mem_base)
     {
         panic("invalid physical memory range from DTB");
     }
-    uint64_t mem_end = mem_base + mem_size;
+    uint64_t mem_end = mem_base + mem_size;  //0x88000000
     if (mem_base < DRAM_BASE || mem_base > KERNEL_BEGIN_PADDR ||
         mem_end <= KERNEL_BEGIN_PADDR)
     {
@@ -110,8 +110,8 @@ static void page_init(void)
     uintptr_t managed_end = mem_end < PHYSICAL_MEMORY_END
                                 ? mem_end
                                 : PHYSICAL_MEMORY_END;
-    managed_end = ROUNDDOWN(managed_end, PGSIZE);
-    npage = PPN(managed_end);
+    managed_end = ROUNDDOWN(managed_end, PGSIZE);  //0x88000000
+    npage = PPN(managed_end);  //转换为物理页号
     if (npage <= nbase)
     {
         panic("no physical pages in the manageable range");
@@ -119,8 +119,8 @@ static void page_init(void)
 
     // 4. The descriptor array lives after the kernel, at a virtual address.
     // There is one descriptor for every physical page in [nbase, npage).
-    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);
-    uintptr_t pages_pa = PADDR(pages);
+    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);   //这是虚拟地址（描述符数组头）
+    uintptr_t pages_pa = PADDR(pages);   //换成物理地址
     size_t descriptor_bytes = (npage - nbase) * sizeof(struct Page);
     if (pages_pa >= managed_end ||
         descriptor_bytes > managed_end - pages_pa)
