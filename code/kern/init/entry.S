@@ -4,11 +4,11 @@
     .section .text,"ax",%progbits
     .globl kern_entry
 kern_entry:
-    # a0: hartid
-    # a1: dtb physical address
+    # a0: hartid  当前硬件线程的编号，即 hart ID
+    # a1: dtb physical address  设备树 DTB 的物理地址
     # save hartid and dtb address
-    la t0, boot_hartid
-    sd a0, 0(t0)
+    la t0, boot_hartid  # 加载boot_hartid到t0
+    sd a0, 0(t0)   #写入8位
     la t0, boot_dtb
     sd a1, 0(t0)
 

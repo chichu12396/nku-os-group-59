@@ -244,7 +244,7 @@ best_fit_check(void) {
     // * - - * *
     assert((p1 = alloc_pages(1)) != NULL);
     assert(alloc_pages(2) != NULL);
-    assert(p0 + 4 == p1);
+    assert(p0 + 4 == p1);   //要 1 页时，Best-Fit 应该选大小刚好为 1 的块（p0+4），而不是把大小 2 的块拆开
 
     #ifdef ucore_test
     score += 1;
