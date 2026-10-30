@@ -29,8 +29,6 @@
 
 ## 一、实验目的
 
-> 本节由 B（2411033-季艾佳）负责，整合稿根据实验要求与最终实现整理。
-
 本实验的主要目的是：
 
 1. 理解 RISC-V 的 Trap 机制：硬件在中断/异常发生时如何记录 `sepc`、`scause`、`sstatus`，以及 `sret` 如何返回。
@@ -58,7 +56,6 @@
 
 ## 三、实验整体逻辑分析
 
-> 本章回答两个问题：这一章按照什么主线展开；各个功能为什么要按这个顺序实现。
 
 ### 3.1 本章节的逻辑主线
 
@@ -318,11 +315,10 @@ tf->epc += ((insn & 0x3) == 0x3) ? 4 : 2;
 
 ## 四、实验内容与实现
 
-### 功能模块一：`RESTORE_ALL`（A 负责）
+### 功能模块一：`RESTORE_ALL`
 
 **负责人：** 2413346-易响
 
-> 本节由 A（2413346-易响）负责；C 根据 A 的 `report/prompt-A.md` 与合并后的最终实现整理，迭代过程记录代码审查与联调中确认的问题。
 
 #### 模块功能描述
 
@@ -354,11 +350,11 @@ tf->epc += ((insn & 0x3) == 0x3) ? 4 : 2;
 
 ````markdown
 [PROMPT]
-**任务**：修改 `kern/trap/trapentry.S`，在 `.macro RESTORE_ALL` 与 `.endm` 之间实现 Trap 上下文恢复宏。它与文件中已有的 `SAVE_ALL` 配对：`SAVE_ALL` 在进入 Trap 时把一个完整的 `struct trapframe` 放到当前内核栈顶，`RESTORE_ALL` 要在 `__trapret` 中被调用，从该 trapframe 恢复处理器状态，使紧随其后的 `sret` 能回到被中断的执行流。只处理本实验的 S 态陷入场景。
+任务：修改 `kern/trap/trapentry.S`，在 `.macro RESTORE_ALL` 与 `.endm` 之间实现 Trap 上下文恢复宏。它与文件中已有的 `SAVE_ALL` 配对：`SAVE_ALL` 在进入 Trap 时把一个完整的 `struct trapframe` 放到当前内核栈顶，`RESTORE_ALL` 要在 `__trapret` 中被调用，从该 trapframe 恢复处理器状态，使紧随其后的 `sret` 能回到被中断的执行流。只处理本实验的 S 态陷入场景。
 
-**操作要求**：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `#lab3 function1 YOUR CODE` 所在的宏体，保留该 `#lab3` 注释并把 `YOUR CODE` 换成 `2413346`；不得修改 `SAVE_ALL`、`struct trapframe`、`trap()` 签名、`.align(2)` 以及 `__alltraps` / `__trapret` 的结构；不要新增函数、全局符号或数据。
+操作要求：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `#lab3 function1 YOUR CODE` 所在的宏体，保留该 `#lab3` 注释并把 `YOUR CODE` 换成 `2413346`；不得修改 `SAVE_ALL`、`struct trapframe`、`trap()` 签名、`.align(2)` 以及 `__alltraps` / `__trapret` 的结构；不要新增函数、全局符号或数据。
 
-**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和布局为准，不要引入与本任务无关的功能。
+输出要求：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和布局为准，不要引入与本任务无关的功能。
 
 [RELY]
 // 数据结构（kern/trap/trap.h）
@@ -407,23 +403,23 @@ struct trapframe {
 可以添加：宏内部使用的临时寄存器；但不得新增宏、函数、全局符号或数据。
 
 [SPECIFICATION]
-## RESTORE_ALL
-**Pre-Condition**:
+RESTORE_ALL:
+Pre-Condition:
 - `sp` 指向一个由 `SAVE_ALL` 构造的完整 trapframe（36 个字）。
 - 进入宏时 `sstatus.SIE = 0`、`sstatus.SPP = 1`（本实验均从 S 态陷入）。
 - 除 `sp` 外，通用寄存器的内容不可信；CSR 中的 `sstatus`/`sepc` 不一定等于 trapframe 中的值。
 
-**Post-Condition**:
+Post-Condition:
 - `sstatus` 被写回为 `tf->status`，`sepc` 被写回为 `tf->epc`；`tf->epc` 是异常处理函数可能已经修改过的值。
 - `x1`、`x3` … `x31` 恢复为 trapframe 对应槽位的值。
 - `x2` 恢复为 `tf->gpr.sp`（Trap 发生前的 sp）。
 - 恢复 `x2` 之后不再访问栈；宏结束时处理器状态可以直接执行 `sret`。
 - `x0` 保持 0；`sbadaddr`/`scause` 不要求恢复。
 
-**Case 1（正常恢复）**:
+Case 1（正常恢复）:
 - 先从 trapframe 的高偏移读出 `sepc` 与 `sstatus` 并写回 CSR，再按偏移恢复 `x1`、`x3` … `x31`，最后恢复 `x2`。
 
-**Requirements**:
+Requirements:
 - 写 CSR 只能借助通用寄存器；所用临时寄存器必须在后续步骤中从 trapframe 恢复，不能破坏最终结果。
 - `x2` 必须最后恢复，且之后不得再有任何使用 `sp` 的指令。
 - 偏移必须与 `SAVE_ALL` 严格一致（32 = status，33 = epc），不得自行假设其他布局。
@@ -475,13 +471,9 @@ struct trapframe {
 3. **不要在一个模块里塞两种职责**。`RESTORE_ALL` 负责恢复现场，`exception_handler` 负责决定返回地址；把 `epc` 步长放进 `RESTORE_ALL` 会造成重复修改。
 4. **汇编的正确性要靠反汇编和运行验证**。编译通过不代表顺序正确；`objdump` 看指令序列、Test 1 看寄存器现场、Test 3 看反复返回，三者缺一不可。
 
-### 功能模块一：Trap 入口 `__alltraps`（C 负责）
+### 功能模块一：Trap 入口 `__alltraps`
 
 **负责人：** 2412102-聂海丽
-
-> 对应指导书「功能模块一：Trap 上下文恢复与 Trap 入口功能」中 C 负责的部分。
-> 代码位置：`code/kern/trap/trapentry.S` 的 `__alltraps:` 标签内、`SAVE_ALL` 之后。
-> 本文件记录 `__alltraps` 的功能理解、spec 设计、最终提示词、迭代过程与验证，以及 `sync.h` 思考题的答案。
 
 ---
 
@@ -559,15 +551,15 @@ void trap(struct trapframe *tf);   /* kern/trap/trap.h，不可修改 */
 
 #### 最终提示词
 
-以下是经过迭代后最终使用的提示词（四段式）：
+以下是经过迭代后最终使用的提示词：
 
 ````markdown
 [PROMPT]
-**任务**：修改 `kern/trap/trapentry.S`，在 `__alltraps:` 标签内、`SAVE_ALL` 之后、`# sp should be the same as before "jal trap"` 之前，补全 Trap 入口到 C 函数 `trap()` 的调用关系。完成后，`SAVE_ALL` 构造的 Trap frame 应作为 `struct trapframe *` 传给 `trap(struct trapframe *tf)`，`trap()` 返回后应自然进入 `__trapret`。
+任务：修改 `kern/trap/trapentry.S`，在 `__alltraps:` 标签内、`SAVE_ALL` 之后、`# sp should be the same as before "jal trap"` 之前，补全 Trap 入口到 C 函数 `trap()` 的调用关系。完成后，`SAVE_ALL` 构造的 Trap frame 应作为 `struct trapframe *` 传给 `trap(struct trapframe *tf)`，`trap()` 返回后应自然进入 `__trapret`。
 
-**操作要求**：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `#lab3 function1 YOUR CODE` 所在的那一行，保留 `#lab3 function1` 注释前缀并把 `YOUR CODE` 换成 `2412102`；保留 `# sp should be the same as before "jal trap"` 这行注释；不得修改 `SAVE_ALL`、`struct trapframe`、`trap()` 签名、`.align(2)` 以及 `__trapret` 的结构；不要新增函数、全局符号、数据或栈帧操作。
+操作要求：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `#lab3 function1 YOUR CODE` 所在的那一行，保留 `#lab3 function1` 注释前缀并把 `YOUR CODE` 换成 `2412102`；保留 `# sp should be the same as before "jal trap"` 这行注释；不得修改 `SAVE_ALL`、`struct trapframe`、`trap()` 签名、`.align(2)` 以及 `__trapret` 的结构；不要新增函数、全局符号、数据或栈帧操作。
 
-**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和布局为准，不要引入与本任务无关的功能。
+输出要求：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和布局为准，不要引入与本任务无关的功能。
 
 [RELY]
 // 已有的保存逻辑（kern/trap/trapentry.S，不能修改）
@@ -617,21 +609,21 @@ struct trapframe {
 不得新增：栈帧调整、保存/恢复 ra 的 prologue/epilogue、函数、宏、全局符号或数据。
 
 [SPECIFICATION]
-## __alltraps
-**Pre-Condition**:
+ __alltraps:
+Pre-Condition:
 - 进入 `__alltraps` 时，PC 由硬件设为 `stvec`，`sp` 是被打断代码的栈指针。
 - 执行到 `SAVE_ALL` 之后时，`sp` 指向一个完整的、由 36 个 64 位字组成的 Trap frame。
 
-**Post-Condition**:
+Post-Condition:
 - `a0` 等于 `SAVE_ALL` 之后的 `sp`，即当前 Trap frame 的起始地址。
 - 已调用 `trap(a0)`；`trap()` 返回后，下一条被执行的指令位于 `__trapret`。
 - 调用 `trap()` 前后 `sp` 的值完全相同，仍指向同一个 Trap frame。
 - 不改变 Trap frame 的任何内容（`trap()` 的处理结果除外）。
 
-**Case 1（正常入口）**:
+Case 1（正常入口）:
 - `SAVE_ALL` 完成后执行 `mv a0, sp`，再执行 `jal trap`，返回后落入 `__trapret`。
 
-**Requirements**:
+Requirements:
 - 参数必须放在 `a0`，不能放在其他寄存器。
 - `mv a0, sp` 必须在 `SAVE_ALL` 之后，不能放在前面，也不能用 `sscratch` 里的旧 `sp`。
 - `jal trap` 前后不得对 `sp` 做 `addi`，不得添加任何栈帧操作。
@@ -735,11 +727,10 @@ __trapret:
 ---
 
 
-### 功能模块二：中断与异常处理（B 负责）
+### 功能模块二：中断与异常处理
 
 **负责人：** 2411033-季艾佳
 
-> 本节由 B（2411033-季艾佳）负责；整合稿根据合并后的 `trap.c` 最终实现、`tools/grade.sh` 的判定条件与联调结果整理。
 
 #### 模块功能描述
 
@@ -776,11 +767,11 @@ void exception_handler(struct trapframe *tf);
 
 ````markdown
 [PROMPT]
-**任务**：修改 `kern/trap/trap.c`，在 `//lab3 function2 YOUR CODE` 所在位置实现 `interrupt_handler(struct trapframe *tf)` 与 `exception_handler(struct trapframe *tf)`。这两个函数由 `trap_dispatch()` 调用，分别处理中断和异常，处理完成后返回到统一的 Trap 返回流程。只实现本实验要求的处理逻辑，不要修改 `trap_dispatch()`、`trap()`、`print_trapframe()` 等其他函数。
+任务：修改 `kern/trap/trap.c`，在 `//lab3 function2 YOUR CODE` 所在位置实现 `interrupt_handler(struct trapframe *tf)` 与 `exception_handler(struct trapframe *tf)`。这两个函数由 `trap_dispatch()` 调用，分别处理中断和异常，处理完成后返回到统一的 Trap 返回流程。只实现本实验要求的处理逻辑，不要修改 `trap_dispatch()`、`trap()`、`print_trapframe()` 等其他函数。
 
-**操作要求**：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `//lab3 function2 YOUR CODE` 所在位置，保留 `lab3` 注释并把 `YOUR CODE` 换成 `2411033`；不得修改两个函数的签名；两个函数不能是 `static`（`tools/test_lab3.c` 用 `extern` 引用它们）；需要定义 `SHUTDOWN_AFTER`，并保证 `sbi_shutdown` 有声明；代码必须在本工程 `-Werror` 下编译通过。
+操作要求：必须直接修改项目中的真实文件，而不是只展示代码；只替换 `//lab3 function2 YOUR CODE` 所在位置，保留 `lab3` 注释并把 `YOUR CODE` 换成 `2411033`；不得修改两个函数的签名；两个函数不能是 `static`（`tools/test_lab3.c` 用 `extern` 引用它们）；需要定义 `SHUTDOWN_AFTER`，并保证 `sbi_shutdown` 有声明；代码必须在本工程 `-Werror` 下编译通过。
 
-**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和测试脚本为准，不要引入与本任务无关的功能。
+输出要求：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程中的真实代码和测试脚本为准，不要引入与本任务无关的功能。
 
 [RELY]
 // 数据结构（kern/trap/trap.h）
@@ -825,47 +816,47 @@ static inline void trap_dispatch(struct trapframe *tf) {
 不得修改：两个函数的签名、`trap_dispatch()`、`trap()`、`print_trapframe()`、`print_ticks()` 等其他函数；不得把两个 handler 声明为 `static`。
 
 [SPECIFICATION]
-## interrupt_handler
-**Pre-Condition**:
+interrupt_handler
+Pre-Condition:
 - `tf->cause` 的最高位为 1（中断）。
 - `ticks` 是易失变量，当前值可能不为 0。
 
-**Post-Condition**:
+Post-Condition:
 - `IRQ_S_TIMER`：已经安排了下一次时钟事件；`ticks` 增加 1；若 `ticks % TICK_NUM == 0`，已经调用 `print_ticks()` 并累计打印次数；累计达到 `SHUTDOWN_AFTER` 时已经调用 `sbi_shutdown()`。
 - 其他已知中断：已经输出对应提示。
 - 未知中断：已经输出 `Unknown interrupt: cause N` 并调用 `print_trapframe(tf)`。
 - 不修改 `tf->epc`。
 
-**Case 1（时钟中断）**:
+Case 1（时钟中断）:
 - `cause = tf->cause & ~((uintptr_t)1 << 63)`；`case IRQ_S_TIMER:` 先 `clock_set_next_event()`，再 `ticks++`，再判断是否打印/关机。
 
-**Case 2（软件中断）**:
+Case 2（软件中断）:
 - `IRQ_S_SOFT` 必须输出 `Supervisor software interrupt`。
 
-**Case 3（未知中断）**:
+Case 3（未知中断）:
 - 默认分支输出 `Unknown interrupt: cause %lu`，并 `print_trapframe(tf)`。
 
-**Requirements**:
+Requirements:
 - 每次时钟中断都必须重新调用 `clock_set_next_event()`，否则只会收到一次中断。
 - `ticks` 每收到一次时钟中断必须增加一次；`print_ticks()` 只在 `ticks % TICK_NUM == 0` 时调用。
 - `SHUTDOWN_AFTER` 必须 >= 3（本实验取 10），否则 Test 3 可能在观察到 `ticks=200` 前就关机。
 - 比较中断号前必须先屏蔽 `cause` 的最高位。
 - 不得修改 `tf->epc`。
 
-## exception_handler
-**Pre-Condition**:
+exception_handler:
+Pre-Condition:
 - `tf->cause` 的最高位为 0（异常）。
 - `tf->epc` 指向触发异常的指令。
 
-**Post-Condition**:
+Post-Condition:
 - `CAUSE_ILLEGAL_INSTRUCTION`：已经输出 `Illegal instruction at 0x...`，`tf->epc` 已前进该指令的长度。
 - `CAUSE_BREAKPOINT`：已经输出 `Breakpoint at 0x...`，`tf->epc` 已前进该指令的长度。
 - 其他异常：已经调用 `print_trapframe(tf)`，`tf->epc` 保持不变（不做无意义的推进）。
 
-**Case 1（断点 / 非法指令）**:
+Case 1（断点 / 非法指令）:
 - 读取 `tf->epc` 处的 16 位指令：若 `(insn & 0x3) == 0x3`，说明是 32 位指令，`epc += 4`；否则是 16 位压缩指令，`epc += 2`。
 
-**Requirements**:
+Requirements:
 - 不能固定 `+4`：`ebreak` 在本工具链下是 2 字节的 `c.ebreak`，而测试里的非法指令是 4 字节。
 - 只有真正处理过的异常才推进 `epc`；默认分支打印后直接返回，不推进。
 - 输出格式必须与 `tools/grade.sh` 的 grep 字符串一致。
@@ -944,7 +935,7 @@ static inline void trap_dispatch(struct trapframe *tf) {
 4. **分项测试是最好的反馈信号**。Test 1 失败指向 `epc` 步长或 `RESTORE_ALL`；Test 2 失败指向输出格式或兜底分支；Test 3 失败指向重新上弦或 `SHUTDOWN_AFTER`。按失败项定位，比让 AI 反复重写高效得多。
 
 ### 练习：`sync.h` 中的 `do {} while (0)`
-
+**负责人：** 2412102-聂海丽
 文件 `code/kern/sync/sync.h`：
 
 ```c
@@ -1047,7 +1038,7 @@ else
 
 ### 5.1 测试环境与命令
 
-测试在 WSL 中完成，使用 RISC-V 工具链 `riscv64-unknown-elf-gcc 10.1.0` 与 **QEMU 4.1.1**（实验要求，不能用 PATH 中默认的 7.0.0）。
+测试在 WSL 中完成，使用 RISC-V 工具链 `riscv64-unknown-elf-gcc 10.1.0` 与 **QEMU 4.1.1**
 
 ```bash
 cd ~/OS2026/nku-os-group-59/code
@@ -1055,43 +1046,21 @@ cd ~/OS2026/nku-os-group-59/code
 # 手动运行，观察串口输出
 make QEMU=$HOME/qemu-src/qemu-4.1.1-inst/bin/qemu-system-riscv64 qemu
 
-# 自动评测（grade.sh 直接调用裸命令 qemu-system-riscv64，必须把 4.1.1 放到 PATH 最前面）
+# 自动评测
 PATH="$HOME/qemu-src/qemu-4.1.1-inst/bin:$PATH" make grade
 ```
 
-说明：`make grade` 会先把源码复制到临时目录、用 `tools/inject.py` 注入三个测试用例，再分别以 `GRADE_LAB3_CONTEXT`、`GRADE_LAB3_ILLEGAL`、`GRADE_LAB3_TIMER` 编译运行。**它不会修改学生的源码**；运行结束后临时目录会被删除。
+说明：`make grade` 会先把源码复制到临时目录、用 `tools/inject.py` 注入三个测试用例，再分别以 `GRADE_LAB3_CONTEXT`、`GRADE_LAB3_ILLEGAL`、`GRADE_LAB3_TIMER` 编译运行。
 
 ### 5.2 `make qemu` 的运行输出
 
 启动后可以看到内核加载信息、时钟初始化信息，以及约每秒一行的 `100 ticks`：
-
-```text
-(THU.CST) os is loading ...
-++ setup timer interrupts
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-```
 
 ![make qemu 连续输出 100 ticks](./images/lab3_qemu_100ticks.png)
 
 每行 `100 ticks` 代表又累计了 `TICK_NUM = 100` 次时钟中断（约 1 秒）。能连续打印多行，说明时钟中断被正确重新上弦，Trap 也能反复“进入 → 处理 → 恢复 → 返回”。
 
 ### 5.3 `make grade` 的结果
-
-```text
-Building trap entry, register restore, and breakpoint EPC...
-Running trap entry, register restore, and breakpoint EPC...
-  - trap entry, register restore, and breakpoint EPC: PASS (35/35)
-Building illegal instruction EPC advance and return...
-Running illegal instruction EPC advance and return...
-  - illegal instruction EPC advance and return: PASS (25/25)
-Building re-armed supervisor timer and repeated trap return...
-Running re-armed supervisor timer and repeated trap return...
-  - re-armed supervisor timer and repeated trap return: PASS (40/40)
-Total Score: 100/100
-```
 
 ![make grade 评测结果：三项 PASS，Total Score 100/100](./images/lab3_grade_100.png)
 
@@ -1108,18 +1077,6 @@ Total Score: 100/100
 - **Test 1** 验证“保存/恢复的完整性与 `epc` 步长”，对应 `SAVE_ALL`/`RESTORE_ALL`/`exception_handler`；
 - **Test 2** 验证“异常分类与兜底”，对应 `exception_handler` 和 `print_trapframe`；
 - **Test 3** 验证“中断重新上弦与反复返回”，对应 `interrupt_handler` 和 `clock_set_next_event`。
-
-### 5.5 常见失败现象与定位
-
-| 现象 | 最可能的原因 |
-|---|---|
-| `make qemu` 完全没有输出 | 用了 PATH 里的 QEMU 7.0.0；必须显式指定 4.1.1 |
-| Test 1 失败（寄存器现场） | `RESTORE_ALL` 漏恢复某个寄存器；`x2` 恢复顺序不对；或 `epc` 固定 `+4`（`c.ebreak` 只有 2 字节） |
-| 同一条异常反复触发、串口刷屏 | `RESTORE_ALL` 没把 `tf->epc` 写回 `sepc`；或 handler 没推进 `epc` |
-| 只打印一次 `100 ticks` 就停 | `interrupt_handler` 没有调用 `clock_set_next_event()` |
-| Test 2 缺某个字符串 | handler 输出格式与 `tools/grade.sh` 的 grep 不一致 |
-| Test 3 失败或提前关机 | `SHUTDOWN_AFTER` 太小（本实验取 10） |
-| 链接报 `interrupt_handler` 未定义 | B 的 handler 尚未合并，或函数被写成了 `static` |
 
 ---
 
