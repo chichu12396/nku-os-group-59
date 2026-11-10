@@ -86,10 +86,9 @@ extern struct mm_struct *check_mm_struct;
 //lab3 请补充你在lab3中的代码
 
   //lab3 function2 2411033
-#define SHUTDOWN_AFTER 10
 
 void interrupt_handler(struct trapframe *tf) {
-    static unsigned int print_count = 0;  //统计发生多少次中断，只初始化一次
+    // static unsigned int print_count = 0;  //统计发生多少次中断，只初始化一次
 
     // 去掉 scause 最高位的中断标志，取得中断编号。
     uintptr_t cause = tf->cause &
@@ -123,11 +122,11 @@ void interrupt_handler(struct trapframe *tf) {
 
         if (ticks % TICK_NUM == 0) {
             print_ticks();
-            print_count++;
+            // print_count++;
 
-            if (print_count >= SHUTDOWN_AFTER) {
-                sbi_shutdown();
-            }
+            // if (print_count >= SHUTDOWN_AFTER) {
+            //     sbi_shutdown();
+            // }
         }
         break;
 

@@ -42,6 +42,7 @@ best_fit_init_memmap(struct Page *base, size_t n) {
                 break;
             } else if (list_next(le) == &free_list) {
                 list_add(le, &(base->page_link));
+                 break;
             }
         }
     }
@@ -115,6 +116,7 @@ best_fit_free_pages(struct Page *base, size_t n) {
                 break;
             } else if (list_next(le) == &free_list) {
                 list_add(le, &(base->page_link));
+                 break;
             }
         }
     }
