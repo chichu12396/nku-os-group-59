@@ -4,7 +4,7 @@
 #include <stdio.h>
 
 //lab2 请补充你在lab2中的代码
-
+ 
 // Framework tests: students must not modify basic_check or best_fit_check.
 static void
 basic_check(void) {

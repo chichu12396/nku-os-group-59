@@ -88,6 +88,72 @@ size_t nr_free_pages(void)
 }
 
 //lab2 请补充你在lab2中的代码
+// lab2 function1 2411033
+static void page_init(void)
+{
+    extern char end[];
+
+    // 1. DTB reports physical addresses; its end is an exclusive bound.
+    uint64_t mem_base = get_memory_base();    //0x80000000
+    uint64_t mem_size = get_memory_size();    //0x8000000
+    if (mem_base == 0 || mem_size == 0 ||
+        mem_size > (uint64_t)-1 - mem_base)
+    {
+        panic("invalid physical memory range from DTB");
+    }
+    uint64_t mem_end = mem_base + mem_size;  //0x88000000
+    if (mem_base < DRAM_BASE || mem_base > KERNEL_BEGIN_PADDR ||
+        mem_end <= KERNEL_BEGIN_PADDR)
+    {
+        panic("DTB memory does not cover the kernel memory layout");
+    }
+
+    // 2. entry.S already enabled this fixed virtual-to-physical mapping.
+    // Set the offset before the first PADDR() call.
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    cprintf("physical memory map:\n");
+    cprintf("  memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            mem_size, mem_base, mem_end - 1);
+
+    // 3. Manage only full pages below the framework's physical upper bound.
+    uintptr_t managed_end = mem_end < PHYSICAL_MEMORY_END
+                                ? mem_end
+                                : PHYSICAL_MEMORY_END;
+    managed_end = ROUNDDOWN(managed_end, PGSIZE);  //0x88000000
+    npage = PPN(managed_end);  //转换为物理页号
+    if (npage <= nbase)
+    {
+        panic("no physical pages in the manageable range");
+    }
+
+    // 4. The descriptor array lives after the kernel, at a virtual address.
+    // There is one descriptor for every physical page in [nbase, npage).
+    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);   //这是虚拟地址（描述符数组头）
+    uintptr_t pages_pa = PADDR(pages);   //换成物理地址
+    size_t descriptor_bytes = (npage - nbase) * sizeof(struct Page);
+    if (pages_pa >= managed_end ||
+        descriptor_bytes > managed_end - pages_pa)
+    {
+        panic("not enough memory for physical page descriptors");
+    }
+
+    // 5. Reserve everything first, including OpenSBI, kernel and descriptors.
+    for (size_t i = 0; i < npage - nbase; i++)
+    {
+        pages[i].flags = 0;
+        pages[i].property = 0;
+        set_page_ref(&pages[i], 0);
+        list_init(&pages[i].page_link);
+        SetPageReserved(&pages[i]);
+    }
+
+    // 6. Give only complete pages after the descriptor array to the allocator.
+    uintptr_t free_begin = ROUNDUP(pages_pa + descriptor_bytes, PGSIZE);
+    if (free_begin < managed_end)
+    {
+        init_memmap(pa2page(free_begin), (managed_end - free_begin) / PGSIZE);
+    }
+}
 
 static void enable_paging(void)
 {

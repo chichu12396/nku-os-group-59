@@ -85,6 +85,106 @@ extern struct mm_struct *check_mm_struct;
 
 //lab3 请补充你在lab3中的代码
 
+  //lab3 function2 2411033
+#define SHUTDOWN_AFTER 10
+
+void interrupt_handler(struct trapframe *tf) {
+    static unsigned int print_count = 0;  //统计发生多少次中断，只初始化一次
+
+    // 去掉 scause 最高位的中断标志，取得中断编号。
+    uintptr_t cause = tf->cause &
+        ~((uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1));
+
+    switch (cause) {
+    case IRQ_U_SOFT:
+        cprintf("User software interrupt\n");
+        break;
+
+    case IRQ_S_SOFT:
+        cprintf("Supervisor software interrupt\n");
+        break;
+
+    case IRQ_H_SOFT:
+        cprintf("Hypervisor software interrupt\n");
+        break;
+
+    case IRQ_M_SOFT:
+        cprintf("Machine software interrupt\n");
+        break;
+
+    case IRQ_U_TIMER:
+        cprintf("User timer interrupt\n");
+        break;
+
+    case IRQ_S_TIMER:
+        // 每次收到时钟中断，都安排下一次时钟事件。
+        clock_set_next_event();
+        ticks++;
+
+        if (ticks % TICK_NUM == 0) {
+            print_ticks();
+            print_count++;
+
+            if (print_count >= SHUTDOWN_AFTER) {
+                sbi_shutdown();
+            }
+        }
+        break;
+
+    case IRQ_H_TIMER:
+        cprintf("Hypervisor timer interrupt\n");
+        break;
+
+    case IRQ_M_TIMER:
+        cprintf("Machine timer interrupt\n");
+        break;
+
+    case IRQ_U_EXT:
+        cprintf("User external interrupt\n");
+        break;
+
+    case IRQ_S_EXT:
+        cprintf("Supervisor external interrupt\n");
+        break;
+
+    case IRQ_H_EXT:
+        cprintf("Hypervisor external interrupt\n");
+        break;
+
+    case IRQ_M_EXT:
+        cprintf("Machine external interrupt\n");
+        break;
+
+    default:
+        cprintf("Unknown interrupt: cause %lu\n",
+                (unsigned long)cause);
+        print_trapframe(tf);
+        break;
+    }
+}
+
+void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+    case CAUSE_ILLEGAL_INSTRUCTION:
+        cprintf("Illegal instruction at 0x%016lx\n",
+                (unsigned long)tf->epc);
+        break;
+
+    case CAUSE_BREAKPOINT:
+        cprintf("Breakpoint at 0x%016lx\n",
+                (unsigned long)tf->epc);
+        break;
+
+    default:
+        print_trapframe(tf);
+        return;
+    }
+
+    // 本实验需要区分 2 字节压缩指令和 4 字节普通指令。
+    //从 tf->epc 指向的地址开始读取两个字节，再取这个 16 位数的最低两位.你们采用小端存储，因此其中包含指令的最低位。
+    uint16_t instruction = *(const volatile uint16_t *)tf->epc;  //uint16_t表示此次读取 2 字节
+    tf->epc += ((instruction & 0x3) == 0x3) ? 4 : 2;
+}
 
 
 /* *
