@@ -221,4 +221,44 @@ init_main(void *arg)
 //LAB4 function2 YOUR CODE
 
 
-//LAB4 function3 YOUR CODE
+//LAB4 function3 2411033
+void cpu_idle(void)
+{
+    while (1)
+    {
+        if (current->need_resched)
+        {
+            schedule();
+        }
+    }
+}
+void proc_run(struct proc_struct *proc)
+{
+    if (proc != current)
+    {
+        bool intr_flag;
+        local_intr_save(intr_flag);
+
+        // 保留旧线程，稍后将它的寄存器现场保存到 context。
+        struct proc_struct *prev = current;
+
+        // 更新当前线程指针。
+        current = proc;
+
+        // pgdir 是页表根的物理地址。
+        // RV64 satp：高 4 位为模式，低位保存页表根的物理页号。
+        uintptr_t satp_value =
+            ((uintptr_t)SATP_MODE_SV39 << 60) |
+            (proc->pgdir >> RISCV_PGSHIFT);
+
+        write_csr(satp, satp_value);
+
+        // 切换页表后，清除旧的地址翻译缓存。
+        asm volatile("sfence.vma" ::: "memory");
+
+        // 保存旧线程的 context，恢复目标线程的 context。
+        switch_to(&prev->context, &proc->context);
+
+        local_intr_restore(intr_flag);
+    }
+}
