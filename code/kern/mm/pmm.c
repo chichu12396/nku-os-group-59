@@ -286,13 +286,71 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
     return NULL;
 }
 
-//LAB4 function1 YOUR CODE
+//LAB4 function1 2412102
 
+// 删除一个有效的叶子页表项：引用计数减一，归零则释放物理页，
+// 清空页表项并失效对应 TLB。
+static void
+page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+{
+    if (!(*ptep & PTE_V))
+    {
+        return;
+    }
 
+    struct Page *page = pte2page(*ptep);
+    if (page_ref_dec(page) == 0)
+    {
+        free_page(page);
+    }
 
+    *ptep = 0;
+    tlb_invalidate(pgdir, la);
+}
 
+// page_insert - 建立或更新 la 到 page 的映射，权限位设置为 perm。
+int
+page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
 
+    page_ref_inc(page);
 
+    if (*ptep & PTE_V)
+    {
+        struct Page *old = pte2page(*ptep);
+        if (old == page)
+        {
+            // 同一物理页重复映射到同一地址：只更新权限，引用计数保持不变。
+            page_ref_dec(page);
+        }
+        else
+        {
+            // 该地址原来映射到另一个物理页：撤销旧映射并维护旧页引用计数。
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+
+    // pte_create() 内部已经置 PTE_V；这里用赋值覆盖旧权限位。
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+// page_remove - 删除 la 的映射；未映射时静默返回，保证幂等。
+void
+page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL && (*ptep & PTE_V))
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
 
 // invalidate a TLB entry, but only if the page tables being
 // edited are the ones currently in use by the processor.
