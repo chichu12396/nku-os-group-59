@@ -388,3 +388,98 @@ switch_to(struct context *from, struct context *to)
 - 添加代码段、对齐、全局符号和函数类型声明。
 - 已给出完整汇编实现，并核对字段偏移及调用约定。
 - 汇编与链接结果：已实际构建确认。
+
+### Challenge：中断状态的保存、屏蔽与恢复
+
+**负责人：** 2411033-季艾佳
+
+`local_intr_save(intr_flag)` 和 `local_intr_restore(intr_flag)` 用于保护临界区。前者记录进入临界区之前的中断使能状态，并关闭中断；后者根据记录恢复原状态，避免无条件开启中断。
+
+**1. 保存状态并关闭中断**
+
+`local_intr_save()` 最终调用 `__intr_save()`：
+
+```c
+static inline bool __intr_save(void)
+{
+    if (read_csr(sstatus) & SSTATUS_SIE)
+    {
+        intr_disable();
+        return 1;
+    }
+    return 0;
+}
+```
+
+函数读取 `sstatus`，通过 `SSTATUS_SIE` 掩码检查 S 态中断使能位：
+
+- 原来允许中断：调用 `intr_disable()`，返回 `1`。
+- 原来已经关闭中断：保持关闭，返回 `0`。
+
+`intr_disable()` 通过清除 `sstatus.SIE` 屏蔽相应的中断：
+
+```c
+void intr_disable(void)
+{
+    clear_csr(sstatus, SSTATUS_SIE);
+}
+```
+
+因此，`intr_flag` 保存的是原来的中断开关状态，并非整个 `sstatus`。
+
+**2. 按原状态恢复中断**
+
+`local_intr_restore()` 最终调用：
+
+```c
+static inline void __intr_restore(bool flag)
+{
+    if (flag)
+    {
+        intr_enable();
+    }
+}
+```
+
+只有进入临界区前允许中断，函数才调用 `intr_enable()`，重新设置 `sstatus.SIE`。如果之前已经关闭中断，则继续保持关闭。
+
+这种方式可以配合嵌套的临界区。以外层调用前中断开启为例：
+
+| 操作 | 保存的状态 | 操作后的 SIE |
+|---|---:|---:|
+| 外层保存并关闭中断 | 外层 flag = 1 | 0 |
+| 内层保存并关闭中断 | 内层 flag = 0 | 0 |
+| 内层恢复 | 根据内层 flag 保持关闭 | 0 |
+| 外层恢复 | 根据外层 flag 重新开启 | 1 |
+
+内层退出时不会提前打开中断，外层临界区仍受到保护。
+
+**3. 在本实验调度中的作用**
+
+`schedule()` 需要读取线程状态、选择目标线程并更新调度信息；`proc_run()` 需要更新 `current`、切换页表并恢复目标上下文。这些操作需要保持一致，避免中断处理代码观察到只完成一部分的切换状态。
+
+因此，两者均在关键区域使用：
+
+```c
+bool intr_flag;
+local_intr_save(intr_flag);
+
+/* 调度或上下文切换的关键操作 */
+
+local_intr_restore(intr_flag);
+```
+
+当 `schedule()` 调用 `proc_run()` 时，中断已经关闭，内层保存到的状态为 `0`，不会提前开启中断。如果执行中切换到了其他线程，原线程需要等到再次获得 CPU 后，才继续完成自身调用链中的中断恢复。
+
+**4. `do { ... } while (0)` 的作用**
+
+```c
+#define local_intr_save(x) \
+    do {                   \
+        x = __intr_save(); \
+    } while (0)
+```
+
+这里的循环只执行一次，作用是把宏包装成一条完整语句，方便在 `if...else` 等位置使用，并为以后增加多条语句保留安全的语法结构。它本身不负责关闭中断，关闭动作由 `__intr_save()` 调用的 `intr_disable()` 完成。
+
+这种保护只影响当前 CPU 上相应的可屏蔽中断，不能阻止同步异常，也不能单独解决多核 CPU 之间的并发访问问题。
