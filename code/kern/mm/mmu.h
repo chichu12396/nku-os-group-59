@@ -24,26 +24,27 @@
 // |       PPN[1]        |      PPN[0]     |Reserved|D|A|G|U|X|W|R|V|
 // +---------12----------+-----------------+--------+---------------+
 
-// page directory index
+// page directory index页目录索引
 #define PDX1(la) ((((uintptr_t)(la)) >> PDX1SHIFT) & 0x1FF)
 #define PDX0(la) ((((uintptr_t)(la)) >> PDX0SHIFT) & 0x1FF)
 
-// page table index
+// page table index页表索引
 #define PTX(la) ((((uintptr_t)(la)) >> PTXSHIFT) & 0x1FF)
 
-// page number field of address
+// page number field of address提取地址中的页号部分。
 #define PPN(la) (((uintptr_t)(la)) >> PTXSHIFT)
 
-// offset in page
+// offset in page提取页内偏移
 #define PGOFF(la) (((uintptr_t)(la)) & 0xFFF)
 
-// construct linear address from indexes and offset
+// construct linear address from indexes and offset提取页内偏移
 #define PGADDR(d1, d0, t, o) ((uintptr_t)((d1) << PDX1SHIFT |(d0) << PDX0SHIFT | (t) << PTXSHIFT | (o)))
 
-// address in page table or page directory entry
+// address in page table or page directory entry提取页表项或页目录项中记录的地址
 #define PTE_ADDR(pte)   (((uintptr_t)(pte) & ~0x3FF) << (PTXSHIFT - PTE_PPN_SHIFT))
 #define PDE_ADDR(pde)   PTE_ADDR(pde)
-
+// 物理页基址 = PTE_ADDR(*ptep);
+// 最终物理地址 = PTE_ADDR(*ptep) + PGOFF(la);
 /* page directory and page table constants */
 #define NPDEENTRY       512                    // page directory entries per page directory
 #define NPTEENTRY       512                    // page table entries per page table
