@@ -218,7 +218,184 @@ init_main(void *arg)
     return 0;
 }
 
-//LAB4 function2 YOUR CODE
+//LAB4 function2 2413346
+
+// 两个内部辅助函数在 do_fork 之后定义，先给出前置声明。
+static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
+static int copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+
+// alloc_proc - 分配并初始化一个进程控制块。
+// 这里只把 PCB 置为安全的“空白”状态，身份（pid）、内核栈和现场由后续步骤填写。
+static struct proc_struct *
+alloc_proc(void)
+{
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL)
+    {
+        // 刚创建、尚未进入调度。
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        // 上下文和中断帧都清零，避免首次切换时恢复出残留的寄存器值。
+        memset(&(proc->context), 0, sizeof(struct context));
+        proc->tf = NULL;
+        // 内核线程共享内核地址空间，pgdir 保存页表根的物理地址。
+        proc->pgdir = boot_pgdir_pa;
+        proc->flags = 0;
+        memset(proc->name, 0, sizeof(proc->name));
+    }
+    return proc;
+}
+
+// proc_init - 初始化进程管理结构，建立 idleproc 和 initproc
+void proc_init(void)
+{
+    int i;
+
+    // 进程链表和按 pid 索引的哈希表都从空表开始。
+    list_init(&proc_list);
+    for (i = 0; i < HASH_LIST_SIZE; i++)
+    {
+        list_init(hash_list + i);
+    }
+
+    // 第 0 个内核线程 idleproc：直接复用当前的执行现场（bootstack）。
+    if ((idleproc = alloc_proc()) == NULL)
+    {
+        panic("cannot alloc idleproc.\n");
+    }
+    idleproc->pid = 0;
+    idleproc->state = PROC_RUNNABLE;
+    idleproc->kstack = (uintptr_t)bootstack;
+    idleproc->need_resched = 1;
+    set_proc_name(idleproc, "idle");
+    nr_process++;
+
+    // 从此刻起 current 指向 idleproc，后续 do_fork 以它为父进程。
+    current = idleproc;
+
+    // 第 1 个内核线程 initproc：由 kernel_thread 构造首次运行现场后创建。
+    int pid = kernel_thread(init_main, "Hello world!!", 0);
+    if (pid <= 0)
+    {
+        panic("create init_main failed.\n");
+    }
+
+    initproc = find_proc(pid);
+    set_proc_name(initproc, "init");
+
+    assert(idleproc != NULL && idleproc->pid == 0);
+    assert(initproc != NULL && initproc->pid == 1);
+}
+
+// kernel_thread - 用内核函数 fn(arg) 创建一个内核线程
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
+{
+    struct trapframe tf;
+    memset(&tf, 0, sizeof(struct trapframe));
+
+    // kernel_thread_entry 用 s0 作入口、s1 传参数。
+    tf.gpr.s0 = (uintptr_t)fn;
+    tf.gpr.s1 = (uintptr_t)arg;
+    // SPP：sret 返回 S 态；SPIE：返回后保持中断使能；SIE 清零：构造期间不被打断。
+    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+    tf.epc = (uintptr_t)kernel_thread_entry;
+
+    // 内核线程共享内核地址空间，传入 CLONE_VM；stack = 0 表示使用新线程自己的内核栈。
+    return do_fork(clone_flags | CLONE_VM, 0, &tf);
+}
+
+// do_fork - 复制当前线程的执行现场，产生一个新的内核线程
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
+{
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+
+    if (nr_process >= MAX_PROCESS)
+    {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+
+    // 1. 分配 PCB 并记录父进程。
+    if ((proc = alloc_proc()) == NULL)
+    {
+        goto fork_out;
+    }
+    proc->parent = current;
+
+    // 2. 分配内核栈。
+    if (setup_kstack(proc) != 0)
+    {
+        goto bad_fork_cleanup_proc;
+    }
+    // 3. 地址空间处理：本实验为内核线程，共享内核地址空间。
+    if (copy_mm(clone_flags, proc) != 0)
+    {
+        goto bad_fork_cleanup_kstack;
+    }
+    // 4. 构造新线程的中断帧和首次切换使用的上下文。
+    copy_thread(proc, stack, tf);
+
+    // 5. pid 分配、哈希表/链表挂接和计数必须作为一个整体完成。
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc);
+        list_add(&proc_list, &(proc->list_link));
+        nr_process++;
+    }
+    local_intr_restore(intr_flag);
+
+    // 6. 资源、现场、身份都准备好之后才置为就绪态。
+    wakeup_proc(proc);
+
+    // 7. 返回新线程的 pid。
+    ret = proc->pid;
+
+fork_out:
+    return ret;
+
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+
+// copy_thread - 在新线程内核栈上安放中断帧，并设置首次切换的上下文
+static void
+copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
+{
+    // 在新线程自己的内核栈顶为中断帧留出空间，并把模板中断帧复制过去。
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
+    *(proc->tf) = *tf;
+
+    // a0 = 0：从 fork 的角度看，新线程的返回值为 0。
+    proc->tf->gpr.a0 = 0;
+    // 内核线程（esp == 0）首次运行的 sp 指向自己的中断帧；
+    // 若调用者给出了栈（如用户进程 fork），则沿用该栈。
+    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
+
+    // switch_to 恢复该上下文后进入 forkret，再经 forkrets 接上中断帧恢复链。
+    proc->context.ra = (uintptr_t)forkret;
+    proc->context.sp = (uintptr_t)(proc->tf);
+}
+
+// copy_mm - 本阶段只维护地址空间接口：内核线程共享内核地址空间
+static int
+copy_mm(uint32_t clone_flags, struct proc_struct *proc)
+{
+    // 当前创建的都是内核线程，current->mm 本来就是 NULL。
+    assert(current->mm == NULL);
+    proc->mm = NULL;
+    return 0;
+}
 
 
 //LAB4 function3 2411033
