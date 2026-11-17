@@ -50,6 +50,8 @@
 #define KERNTOP (KERNBASE + KMEMSIZE)
 
 #define PHYSICAL_MEMORY_OFFSET 0xFFFFFFFF40000000
+#define KERNEL_BEGIN_PADDR  (KERNBASE - PHYSICAL_MEMORY_OFFSET)
+#define PHYSICAL_MEMORY_END (KERNTOP - PHYSICAL_MEMORY_OFFSET)
 /* *
  * Virtual page table. Entry PDX[VPT] in the PD (Page Directory) contains
  * a pointer to the page directory itself, thereby turning the PD into a page

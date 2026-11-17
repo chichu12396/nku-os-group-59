@@ -126,17 +126,15 @@ void interrupt_handler(struct trapframe *tf) {
         break;
 
     case IRQ_S_TIMER:
-        // 每次收到时钟中断，都安排下一次时钟事件。
         clock_set_next_event();
         ticks++;
 
-        if (ticks % TICK_NUM == 0) {
-            print_ticks();
-            // print_count++;
-
-            // if (print_count >= SHUTDOWN_AFTER) {
-            //     sbi_shutdown();
-            // }
+        if (ticks % TICK_NUM == 0)
+        {
+            if (current != NULL)
+            {
+                current->need_resched = 1;
+            }
         }
         break;
 

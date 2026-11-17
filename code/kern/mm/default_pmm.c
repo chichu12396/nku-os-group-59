@@ -5,11 +5,11 @@
 
 //lab2 请补充你在lab2中的代码
 
-  static free_area_t free_area;
+free_area_t free_area;
 
 #define free_list (free_area.free_list)
 #define nr_free (free_area.nr_free)
-
+static void default_check(void);
 static void
 best_fit_init(void) {
     list_init(&free_list);
@@ -238,7 +238,7 @@ const struct pmm_manager default_pmm_manager = {
     .alloc_pages = best_fit_alloc_pages,
     .free_pages = best_fit_free_pages,
     .nr_free_pages = best_fit_nr_free_pages,
-    .check = best_fit_check,
+    .check = default_check,
 };
 
 static void

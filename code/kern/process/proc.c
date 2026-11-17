@@ -98,7 +98,7 @@ static void
 copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
 static int
 copy_mm(uint32_t clone_flags, struct proc_struct *proc);
-
+static void set_links(struct proc_struct *proc);
 int do_exit(int error_code)
 {
     panic("process exit!!.\n");
@@ -127,6 +127,11 @@ alloc_proc(void)
         proc->need_resched = 0;
         proc->parent = NULL;
         proc->mm = NULL;
+        proc->exit_code = 0;
+        proc->wait_state = 0;
+        proc->cptr = NULL;
+        proc->yptr = NULL;
+        proc->optr = NULL;
         // 上下文和中断帧都清零，避免首次切换时恢复出残留的寄存器值。
         memset(&(proc->context), 0, sizeof(struct context));
         proc->tf = NULL;
@@ -231,8 +236,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     {
         proc->pid = get_pid();
         hash_proc(proc);
-        list_add(&proc_list, &(proc->list_link));
-        nr_process++;
+        set_links(proc);
     }
     local_intr_restore(intr_flag);
 

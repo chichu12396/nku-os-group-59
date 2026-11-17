@@ -65,19 +65,25 @@ _save_context:
     STORE s4, 35*REGBYTES(sp)
     .endm
 
-    .macro RESTORE_ALL
+        .macro RESTORE_ALL
+        LOCAL _restore_context
 
-    #lab3：填写你在lab3中实现的代码，并进行修改补充
+        #lab3：在原上下文恢复代码上补充用户态返回支持
 
-    #lab3:填写你在lab3中实现的代码
-     #lab3 function1 2413346
+        LOAD s1, 32*REGBYTES(sp)        # tf->status
+        LOAD s2, 33*REGBYTES(sp)        # tf->epc
 
-    # 1) 先写回 sstatus / sepc。s1、s2 只是临时寄存器，
-    #    后面会用 trapframe 中 x9、x18 的保存值覆盖它们。
-    LOAD s1, 32*REGBYTES(sp)        # tf->status
-    LOAD s2, 33*REGBYTES(sp)        # tf->epc
-    csrw sstatus, s1
-    csrw sepc, s2
+        # SPP=1：返回内核态；SPP=0：返回用户态。
+        andi s0, s1, SSTATUS_SPP
+        bnez s0, _restore_context
+
+        # 返回用户态前，记录下一次 Trap 使用的内核栈顶。
+        addi s0, sp, 36*REGBYTES
+        csrw sscratch, s0
+
+    _restore_context:
+        csrw sstatus, s1
+        csrw sepc, s2
 
     # 2) 恢复除 sp 以外的通用寄存器
     LOAD x1, 1*REGBYTES(sp)         # ra
