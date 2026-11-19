@@ -14,10 +14,15 @@
 //  \--- PDX(la) --/ \--- PTX(la) --/ \---- PGOFF(la) ----/
 //  \----------- PPN(la) -----------/
 //
+//  38           30 29           21 20           12 11          0
+// ┌───────────────┬───────────────┬───────────────┬──────────────┐
+// │  VPN[2]，9位  │  VPN[1]，9位   │  VPN[0]，9位  │ 页内偏移12位  │
+// └───────────────┴───────────────┴───────────────┴──────────────┘
+//     PDX1(la)        PDX0(la)         PTX(la)        PGOFF(la)
 // The PDX, PTX, PGOFF, and PPN macros decompose linear addresses as shown.
 // To construct a linear address la from PDX(la), PTX(la), and PGOFF(la),
 // use PGADDR(PDX(la), PTX(la), PGOFF(la)).
-
+//物理页号 PPN 位于页表项的 第 53～10 位；
 // RISC-V uses 32-bit virtual address to access 34-bit physical address!
 // Sv32 page table entry:
 // +---------12----------+--------10-------+---2----+-------8-------+
@@ -41,6 +46,9 @@
 #define PGADDR(d1, d0, t, o) ((uintptr_t)((d1) << PDX1SHIFT |(d0) << PDX0SHIFT | (t) << PTXSHIFT | (o)))
 
 // address in page table or page directory entry提取页表项或页目录项中记录的地址
+// 提取出来的地址可能指向：
+// - 下一级页表，如果当前项是非叶子项；
+// - 实际映射的物理页基址，如果当前项是叶子项。
 #define PTE_ADDR(pte)   (((uintptr_t)(pte) & ~0x3FF) << (PTXSHIFT - PTE_PPN_SHIFT))
 #define PDE_ADDR(pde)   PTE_ADDR(pde)
 // 物理页基址 = PTE_ADDR(*ptep);
@@ -59,7 +67,7 @@
 #define PDX1SHIFT		30
 #define PTE_PPN_SHIFT   10                      // offset of PPN in a physical address
 
-// page table entry (PTE) fields
+// page table entry (PTE) fields页表项中的权限和状态标志。
 #define PTE_V     0x001 // Valid
 #define PTE_R     0x002 // Read
 #define PTE_W     0x004 // Write
@@ -69,7 +77,7 @@
 #define PTE_A     0x040 // Accessed
 #define PTE_D     0x080 // Dirty
 #define PTE_SOFT  0x300 // Reserved for Software
-
+// 最后的宏是常用权限组合。
 #define PAGE_TABLE_DIR (PTE_V)
 #define READ_ONLY (PTE_R | PTE_V)
 #define READ_WRITE (PTE_R | PTE_W | PTE_V)

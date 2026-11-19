@@ -250,6 +250,7 @@ pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
         {
             return NULL;
         }
+        //尝试分配一个物理页作为下一级页表，清零并登记到上级表项中。
         set_page_ref(page, 1);
         uintptr_t pa = page2pa(page);
         memset(KADDR(pa), 0, PGSIZE);
@@ -269,6 +270,7 @@ pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
         *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
     }
     return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
+    // 最末级页表项的地址
 }
 
 // get_page - get related Page struct for linear address la using PDT pgdir
@@ -313,6 +315,11 @@ int
 page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
 {
     pte_t *ptep = get_pte(pgdir, la, 1);
+//     ptep：页表项所在内存位置的地址(虚拟地址)；
+// *ptep：页表项中保存的物理页号和标志。
+// ptep → 页表中的一个槽位
+//           ↓ 读取 *ptep，解析其中的物理页号
+//        找到目标物理页
     if (ptep == NULL)
     {
         return -E_NO_MEM;
@@ -336,6 +343,10 @@ page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
     }
 
     // pte_create() 内部已经置 PTE_V；这里用赋值覆盖旧权限位。
+    //     page2ppn(page) 得到目标物理页号；
+    // pte_create() 把页号和权限组合为页表项，并设置 PTE_V；
+    // 赋值覆盖原来的页号和权限；
+    // 刷新对应 TLB，避免 CPU 继续使用旧翻译结果。
     *ptep = pte_create(page2ppn(page), perm);
     tlb_invalidate(pgdir, la);
     return 0;
@@ -381,20 +392,24 @@ static void check_pgdir(void)
     assert(get_page(boot_pgdir_va, 0x0, NULL) == NULL);
 
     struct Page *p1, *p2;
-    p1 = alloc_page();
-    assert(page_insert(boot_pgdir_va, p1, 0x0, 0) == 0);
-
+    p1 = alloc_page();//拿过来一个物理页面
+    assert(page_insert(boot_pgdir_va, p1, 0x0, 0) == 0);//把这个物理页面通过多级页表映射到0x0
+    //一张最末级页表创建出来，就同时拥有 512 个表项槽位，并先全部清零。
+    //虚拟页 0x0000 → 物理页 p1
     pte_t *ptep;
     assert((ptep = get_pte(boot_pgdir_va, 0x0, 0)) != NULL);
     assert(pte2page(*ptep) == p1);
     assert(page_ref(p1) == 1);
-
+    //手动走三级页表，验证 get_pte() 的定位
     ptep = (pte_t *)KADDR(PDE_ADDR(boot_pgdir_va[0]));
     ptep = (pte_t *)KADDR(PDE_ADDR(ptep[0])) + 1;
+    // 第二个虚拟页的开头,现有页表已经提供了这个槽位，所以仍然可以返回它的地址。
     assert(get_pte(boot_pgdir_va, PGSIZE, 0) == ptep);
 
     p2 = alloc_page();
     assert(page_insert(boot_pgdir_va, p2, PGSIZE, PTE_U | PTE_W) == 0);
+    // 虚拟页 0x0000 → p1
+    // 虚拟页 0x1000 → p2
     assert((ptep = get_pte(boot_pgdir_va, PGSIZE, 0)) != NULL);
     assert(*ptep & PTE_U);
     assert(*ptep & PTE_W);
@@ -402,6 +417,11 @@ static void check_pgdir(void)
     assert(page_ref(p2) == 1);
 
     assert(page_insert(boot_pgdir_va, p1, PGSIZE, 0) == 0);
+    // 虚拟页 0x0000 ──┐
+    //                 ├──→ p1
+    // 虚拟页 0x1000 ──┘
+
+    // p2 不再被映射
     assert(page_ref(p1) == 2);
     assert(page_ref(p2) == 0);
     assert((ptep = get_pte(boot_pgdir_va, PGSIZE, 0)) != NULL);
@@ -417,7 +437,7 @@ static void check_pgdir(void)
     assert(page_ref(p2) == 0);
 
     assert(page_ref(pde2page(boot_pgdir_va[0])) == 1);
-
+//存放页表的物理页仍然存在，所以测试手动释放它们
     pde_t *pd1 = boot_pgdir_va, *pd0 = page2kva(pde2page(boot_pgdir_va[0]));
     free_page(pde2page(pd0[0]));
     free_page(pde2page(pd1[0]));
