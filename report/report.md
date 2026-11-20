@@ -79,11 +79,6 @@ kern_init
 3. **再创建线程**：B 的 `proc_init()` 需要分配 PCB 和内核栈，构造 `idleproc` 与 `initproc`，并设置 `current`。
 4. **最后调度与切换**：C 的 `schedule()` 从就绪链表中选线程，`proc_run()` 更新 `current`、切换页表并调用 `switch_to()`；`switch_to()` 恢复的 `context.ra` 指向 `forkret`，从而接上已有的中断帧恢复链。
 
-### 3.3 “开发可并行、运行有依赖”
-
-- **开发可以并行**：A/B/C 修改不同文件或不同函数，接口由头文件固定。A 只动 `pmm.c`，B/C 动 `proc.c`、`sched.c`、`switch.S`，彼此不会频繁冲突。
-- **运行有依赖**：整机启动必须按上面的顺序。A 的页映射自检先于 B 的 `proc_init`；B 构造的 PCB、内核栈、`context.ra/sp` 先于 C 的 `schedule/proc_run/switch_to`；首次运行还需要 B/C 共同确认中断帧与上下文布局。
-- 因此，代码可以并行写，但正式整机验证要等三人实现合齐；A 在 B/C 未完成时用 `/tmp` 临时桩只验证 PMM 子功能，不改变仓库结构。
 
 ### 3.4 首次运行的衔接
 
@@ -98,7 +93,7 @@ switch_to 恢复新线程 context
  → 目标线程函数
 ```
 
-这条链要求 B 的 `copy_thread()` 正确设置 `context.ra`、`context.sp` 和内核栈上的中断帧，C 的 `switch_to()` 严格按 `struct context` 的字段顺序恢复寄存器。A 的页操作不直接参与每次线程创建，但为内核栈和页表提供了可用的内存基础。
+这条链要求`copy_thread()` 正确设置 `context.ra`、`context.sp` 和内核栈上的中断帧， `switch_to()` 严格按 `struct context` 的字段顺序恢复寄存器。页操作不直接参与每次线程创建，但为内核栈和页表提供了可用的内存基础。
 
 ---
 
@@ -144,12 +139,6 @@ static void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep);
 | 删除已映射地址 | `ref` 减 1，清 PTE，失效 TLB |
 | 删除未映射/重复删除 | 静默返回，不 panic |
 
-**与其他模块的关系：**
-
-- 依赖 `get_pte()` 完成三级页表查找与中间页表分配；
-- 依赖 `pte_create()` 生成 PTE，依赖 `page_ref_inc/dec`、`free_page()` 管理物理页；
-- 依赖 `tlb_invalidate()` 失效翻译缓存；
-- B 的内核线程共享内核页表，线程创建不会频繁直接调用本模块；A 的作用主要体现在启动自检和内存基础。
 
 #### 4.1.2 规格说明（spec）
 
@@ -389,7 +378,7 @@ page_remove(pde_t *pgdir, uintptr_t la)
 3. 明确“`page_remove` 用 `create=0` 并检查 `PTE_V`”，避免未映射地址 panic。
 4. 明确“每次改叶子 PTE 后 `tlb_invalidate`”，避免旧翻译残留。
 5. 明确“不释放中间页表页”，避免 `check_pgdir` 最后断言失败。
-6. 明确“保留 `LAB4` 注释、替换学号”，避免提交规范问题。
+
 
 
 ### 功能模块二 进程创建及初始化
@@ -999,29 +988,13 @@ timeout 18 qemu-system-riscv64 -machine virt -nographic -bios default \
 - 输出两条 `To U:` 问候，说明参数 `"Hello world!!"` 通过 `s1 → a0` 正确传递；
 - `init_main` 返回后进入 `do_exit()` 的 `panic("process exit!!.")`。这是框架保留的占位实现，属于本阶段预期行为，不是创建模块的缺陷。
 
-**评分验证：**
-
-```bash
-make grade
-```
-
-输出：
-
-```text
-  -check PMM:                                OK
-  -check Process Create:                     OK
-  -check Schedule:                           OK
-Total Score: 30/30
-```
-
-其中 `check Process Create` 对应本模块。注入测试的完整运行还额外打印了 `[Test Process Create] PASS` 和 `[Test Schedule] PASS`（见 `report/images/lab4_B_process_create.log`）。
 
 ---
 
 **关键改进点总结：**
 
 1. 在 `do_fork()` 之前补充 `copy_thread`/`copy_mm` 的 `static` 前置声明，使函数定义顺序与声明一致。
-2. 构建前执行 `make clean`，避免复用其他路径的旧 `obj/`，保证 A/B/C 三人的代码都参与编译。
+2. 构建前执行 `make clean`，避免复用其他路径的旧 `obj/`，保证三人的代码都参与编译。
 3. 在 spec 与提示词中显式写出 `context.sp = tf`、`tf->gpr.sp = tf`、`pgdir = boot_pgdir_pa` 三个“现场关键值”，减少首次运行类错误。
 4. 用 `[Test Process Create] PASS`、`make qemu` 输出和 `make grade 30/30` 三层证据验证，而不是只看编译通过。
 
