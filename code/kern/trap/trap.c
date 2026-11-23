@@ -170,31 +170,69 @@ void interrupt_handler(struct trapframe *tf) {
     }
 }
 
+//lab5 function1 2411033 update exception_handler
+
 void exception_handler(struct trapframe *tf) {
     switch (tf->cause) {
+    case CAUSE_USER_ECALL:
+        /*
+         * ecall 固定为 4 字节。
+         * 先推进返回地址，避免返回用户态后再次执行 ecall。
+         */
+        tf->epc += 4;
+        syscall();
+        return;
+
     case CAUSE_ILLEGAL_INSTRUCTION:
-        cprintf("Illegal instruction at 0x%016lx\n",
-                (unsigned long)tf->epc);
+    case CAUSE_BREAKPOINT:
+        /*
+         * 保留此前 Lab3 中内核态测试异常的处理方式。
+         * 用户态触发这两类异常则进入下面的进程终止路径。
+         */
+        if (trap_in_kernel(tf)) {
+            cprintf("%s at 0x%016llx\n",
+                    tf->cause == CAUSE_BREAKPOINT
+                        ? "Breakpoint" : "Illegal instruction",
+                    (unsigned long long)tf->epc);
+
+            uint16_t instruction =
+                *(const volatile uint16_t *)tf->epc;
+
+            /* 区分 2 字节压缩指令和 4 字节普通指令。 */
+            tf->epc += ((instruction & 0x3) == 0x3) ? 4 : 2;
+            return;
+        }
         break;
 
-    case CAUSE_BREAKPOINT:
-        cprintf("Breakpoint at 0x%016lx\n",
-                (unsigned long)tf->epc);
+    case CAUSE_FETCH_PAGE_FAULT:
+    case CAUSE_LOAD_PAGE_FAULT:
+    case CAUSE_STORE_PAGE_FAULT:
+        /*
+         * 基础版本中，无法处理的用户页异常终止当前进程。
+         *
+         * 后续在这里接入 COW：
+         * 成功修复映射后直接 return，保持 epc 不变，
+         * 让引发异常的指令重新执行。
+         */
         break;
 
     default:
-        print_trapframe(tf);
-        return;
+        break;
     }
 
-    // 本实验需要区分 2 字节压缩指令和 4 字节普通指令。
-    //从 tf->epc 指向的地址开始读取两个字节，再取这个 16 位数的最低两位.你们采用小端存储，因此其中包含指令的最低位。
-    uint16_t instruction = *(const volatile uint16_t *)tf->epc;  //uint16_t表示此次读取 2 字节
-    tf->epc += ((instruction & 0x3) == 0x3) ? 4 : 2;
+    print_trapframe(tf);
+
+    /* 用户错误只终止对应进程，避免拖垮内核。 */
+    if (!trap_in_kernel(tf) && current != NULL) {
+        cprintf("Unhandled user exception, kill pid %d.\n",
+                current->pid);
+        do_exit(-E_KILLED);
+        panic("do_exit returned unexpectedly");
+    }
+
+    /* 无法处理的内核异常不能直接跳过。 */
+    panic("Unhandled kernel exception");
 }
-
-//lab5 function1 YOUR CODE update exception_handler
-
 
 static inline void trap_dispatch(struct trapframe *tf)
 {

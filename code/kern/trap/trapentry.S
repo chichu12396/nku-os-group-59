@@ -73,6 +73,10 @@ _save_context:
         LOAD s1, 32*REGBYTES(sp)        # tf->status
         LOAD s2, 33*REGBYTES(sp)        # tf->epc
 
+        # 返回内核态时，sscratch 必须为 0。
+        # 返回用户态时，下面会将其改成内核栈顶。
+        csrw sscratch, zero
+        
         # SPP=1：返回内核态；SPP=0：返回用户态。
         andi s0, s1, SSTATUS_SPP
         bnez s0, _restore_context
