@@ -204,16 +204,19 @@ void exception_handler(struct trapframe *tf) {
         }
         break;
 
+    case CAUSE_STORE_PAGE_FAULT:
+        /* COW Challenge 2411033: retry the same store after fixing its PTE.
+         * Kernel-to-user writes will be adapted separately; do not turn an
+         * arbitrary kernel page fault into a successful user COW fault.
+         */
+        if (!trap_in_kernel(tf) && current != NULL && current->mm != NULL &&
+            do_cow_fault(current->mm, tf->tval) == 0) {
+            return;
+        }
+        break;
+
     case CAUSE_FETCH_PAGE_FAULT:
     case CAUSE_LOAD_PAGE_FAULT:
-    case CAUSE_STORE_PAGE_FAULT:
-        /*
-         * 基础版本中，无法处理的用户页异常终止当前进程。
-         *
-         * 后续在这里接入 COW：
-         * 成功修复映射后直接 return，保持 epc 不变，
-         * 让引发异常的指令重新执行。
-         */
         break;
 
     default:

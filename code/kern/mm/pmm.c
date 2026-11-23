@@ -288,17 +288,21 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
 // note: PT is changed, so the TLB need to be invalidate
 static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
 {
+    bool intr_flag;
+    local_intr_save(intr_flag);
     if (*ptep & PTE_V)
     {
         struct Page *page = pte2page(*ptep);
-        page_ref_dec(page);
-        if (page_ref(page) == 0)
+        assert(page_ref(page) > 0);
+        /* Revoke this mapping before its last reference can be reused. */
+        *ptep = 0;
+        tlb_invalidate(pgdir, la);
+        if (page_ref_dec(page) == 0)
         {
             free_page(page);
         }
-        *ptep = 0;
-        tlb_invalidate(pgdir, la);
     }
+    local_intr_restore(intr_flag);
 }
 
 void unmap_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
@@ -322,69 +326,165 @@ void unmap_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
     } while (start != 0 && start < end);
 }
 
+static bool page_table_empty(pte_t *table)
+{
+    for (size_t i = 0; i < NPTEENTRY; i++) {
+        if (table[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
+    assert(pgdir != NULL);
 
-    uintptr_t d1start, d0start;
-    int free_pt, free_pd0;
-    pde_t *pd0, *pt, pde1, pde0;
-    d1start = ROUNDDOWN(start, PDSIZE);
-    d0start = ROUNDDOWN(start, PTSIZE);
-    do
-    {
-        // level 1 page directory entry
-        pde1 = pgdir[PDX1(d1start)];
-        // if there is a valid entry, get into level 0
-        // and try to free all page tables pointed to by
-        // all valid entries in level 0 page directory,
-        // then try to free this level 0 page directory
-        // and update level 1 entry
-        if (pde1 & PTE_V)
-        {
-            pd0 = page2kva(pde2page(pde1));
-            // try to free all page tables
-            free_pd0 = 1;
-            do
-            {
-                pde0 = pd0[PDX0(d0start)];
-                if (pde0 & PTE_V)
-                {
-                    pt = page2kva(pde2page(pde0));
-                    // try to free page table
-                    free_pt = 1;
-                    for (int i = 0; i < NPTEENTRY; i++)
-                        if (pt[i] & PTE_V)
-                        {
-                            free_pt = 0;
-                            break;
-                        }
-                    // free it only when all entry are already invalid
-                    if (free_pt)
-                    {
-                        free_page(pde2page(pde0));
-                        pd0[PDX0(d0start)] = 0;
-                    }
-                }
-                else
-                    free_pd0 = 0;
-                d0start += PTSIZE;
-            } while (d0start != 0 && d0start < d1start + PDSIZE && d0start < end);
-            // free level 0 page directory only when all pde0s in it are already invalid
-            if (free_pd0)
-            {
-                free_page(pde2page(pde1));
-                pgdir[PDX1(d1start)] = 0;
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    const pte_t leaf = PTE_R | PTE_W | PTE_X;
+
+    for (uintptr_t d1 = ROUNDDOWN(start, PDSIZE); d1 < end; d1 += PDSIZE) {
+        pde_t *pdep1 = &pgdir[PDX1(d1)];
+        if (!(*pdep1 & PTE_V) || (*pdep1 & leaf)) {
+            continue;
+        }
+
+        struct Page *pd_page = pde2page(*pdep1);
+        pde_t *pd0 = page2kva(pd_page);
+        uintptr_t begin = start > d1 ? start : d1;
+        uintptr_t limit = end < d1 + PDSIZE ? end : d1 + PDSIZE;
+
+        for (uintptr_t d0 = ROUNDDOWN(begin, PTSIZE); d0 < limit; d0 += PTSIZE) {
+            pde_t *pdep0 = &pd0[PDX0(d0)];
+            if (!(*pdep0 & PTE_V) || (*pdep0 & leaf)) {
+                continue;
+            }
+            struct Page *pt_page = pde2page(*pdep0);
+            if (page_table_empty(page2kva(pt_page))) {
+                assert(page_ref(pt_page) == 1);
+                *pdep0 = 0;
+                /* Non-leaf changes require a full translation-cache fence
+                 * before the old page-table memory can be reused.
+                 */
+                flush_tlb();
+                page_ref_dec(pt_page);
+                free_page(pt_page);
             }
         }
-        d1start += PDSIZE;
-        d0start = d1start;
-    } while (d1start != 0 && d1start < end);
+
+        /* Check ALL sibling entries, including those outside [start, end).
+         * The old local-range test could free a directory with live siblings.
+         */
+        if (page_table_empty(pd0)) {
+            assert(page_ref(pd_page) == 1);
+            *pdep1 = 0;
+            flush_tlb();
+            page_ref_dec(pd_page);
+            free_page(pd_page);
+        }
+    }
+    local_intr_restore(intr_flag);
 }
 
 
-//lab5 function3 YOUR CODE 
+//lab5 function3 2411033
+
+// COW Challenge 2411033: ordinary private copy and optional COW sharing.
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+    if (to == NULL || from == NULL || to == from) {
+        return -E_INVAL;
+    }
+
+    while (start < end) {
+        /* Single-hart critical section; no process is scheduled here. */
+        bool intr_flag;
+        local_intr_save(intr_flag);
+        int ret = 0;
+
+        pte_t *src = get_pte(from, start, 0);
+        if (src == NULL) {
+            /* No lowest-level page table: skip this 2 MiB interval. */
+            local_intr_restore(intr_flag);
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+        if (!(*src & PTE_V)) {
+            local_intr_restore(intr_flag);
+            start += PGSIZE;
+            continue;
+        }
+
+        uint32_t perm = (uint32_t)(*src & 0x3FF);
+        /* This interface copies 4 KiB user leaf mappings only. */
+        if (!(perm & PTE_U) || !(perm & (PTE_R | PTE_X)) ||
+            ((perm & PTE_W) && !(perm & PTE_R))) {
+            ret = -E_INVAL;
+            goto page_out;
+        }
+
+        pte_t *dst = get_pte(to, start, 1);
+        if (dst == NULL) {
+            ret = -E_NO_MEM;
+            goto page_out;
+        }
+        if (*dst != 0) {
+            ret = -E_INVAL;
+            goto page_out;
+        }
+
+        struct Page *page = pte2page(*src);
+        if (share) {
+            /* Repeated fork must preserve an existing COW marker. Truly
+             * read-only pages are shared without ever gaining that marker.
+             */
+            if (perm & (PTE_W | PTE_COW)) {
+                perm = (perm & ~PTE_W) | PTE_COW;
+            }
+            /* Publish the child mapping before restricting the parent.
+             * Failure leaves this parent PTE unchanged. page_insert itself
+             * increments the shared page's reference count exactly once.
+             */
+            ret = page_insert(to, page, start, perm);
+            if (ret == 0 && *src != pte_create(page2ppn(page), perm)) {
+                *src = pte_create(page2ppn(page), perm);
+                tlb_invalidate(from, start);
+            }
+        }
+        else {
+            /* An eager copy of a COW page is privately writable again. */
+            if (perm & PTE_COW) {
+                perm = (perm | PTE_W) & ~PTE_COW;
+            }
+            struct Page *new_page = alloc_page();
+            if (new_page == NULL) {
+                ret = -E_NO_MEM;
+                goto page_out;
+            }
+            memcpy(page2kva(new_page), page2kva(page), PGSIZE);
+            ret = page_insert(to, new_page, start, perm);
+            if (ret != 0) {
+                free_page(new_page);
+            }
+        }
+
+page_out:
+        local_intr_restore(intr_flag);
+        if (ret != 0) {
+            /* The caller owns partial-child cleanup. Remaining parent COW
+             * mappings stay valid, including the single-reference case.
+             */
+            return ret;
+        }
+        start += PGSIZE;
+    }
+    return 0;
+}
 
 
 //lab4 请补充你在lab4中的代码
@@ -436,7 +536,7 @@ page_remove(pde_t *pgdir, uintptr_t la)
 // edited are the ones currently in use by the processor.
 void tlb_invalidate(pde_t *pgdir, uintptr_t la)
 {
-    asm volatile("sfence.vma %0" : : "r"(la));
+    asm volatile("sfence.vma %0" : : "r"(la) : "memory");
 }
 
 // pgdir_alloc_page - call alloc_page & page_insert functions to

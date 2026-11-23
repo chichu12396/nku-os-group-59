@@ -52,6 +52,8 @@ int mm_map(struct mm_struct *mm, uintptr_t addr, size_t len, uint32_t vm_flags,
            struct vma_struct **vma_store);
 int mm_unmap(struct mm_struct *mm, uintptr_t addr, size_t len);
 int dup_mmap(struct mm_struct *to, struct mm_struct *from);
+/* Resolve a write fault on a present COW user page; leave the PC unchanged. */
+int do_cow_fault(struct mm_struct *mm, uintptr_t addr);
 void exit_mmap(struct mm_struct *mm);
 uintptr_t get_unmapped_area(struct mm_struct *mm, size_t len);
 int mm_brk(struct mm_struct *mm, uintptr_t addr, size_t len);
@@ -61,6 +63,10 @@ extern struct mm_struct *check_mm_struct;
 
 bool user_mem_check(struct mm_struct *mm, uintptr_t start, size_t len, bool write);
 bool copy_from_user(struct mm_struct *mm, void *dst, const void *src, size_t len, bool writable);
+/* COW-aware, page-by-page write into mm; src must be a valid kernel buffer.
+ * A zero-length copy succeeds. On failure no bytes are copied, although some
+ * destination COW pages may already have been made private during preparation.
+ */
 bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len);
 
 static inline int

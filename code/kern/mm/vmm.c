@@ -202,25 +202,84 @@ out:
     return ret;
 }
 
-//lab5 function3 YOUR CODE 
+// COW Challenge 2411033: only present, originally writable user pages qualify.
+int do_cow_fault(struct mm_struct *mm, uintptr_t addr)
+{
+    if (mm == NULL || mm->pgdir == NULL) {
+        return -E_INVAL;
+    }
 
+    /* This lab runs on one hart. Protect PTE/refcount changes from interrupts;
+     * SMP would additionally require shared-page locking and TLB shootdowns.
+     */
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    int ret = -E_INVAL;
 
+    /* Also rejects invalid addresses, read-only VMAs and the stack guard. */
+    if (!user_mem_check(mm, addr, 1, 1)) {
+        goto out;
+    }
+
+    uintptr_t va = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, va, 0);
+    const pte_t required = PTE_V | PTE_U | PTE_R | PTE_COW;
+    if (ptep == NULL || (*ptep & required) != required || (*ptep & PTE_W)) {
+        goto out;
+    }
+
+    struct Page *old_page = pte2page(*ptep);
+    if (page_ref(old_page) < 1) {
+        goto out;
+    }
+
+    uint32_t perm = (uint32_t)(*ptep & 0x3FF);
+    perm = (perm | PTE_W | PTE_A | PTE_D) & ~PTE_COW;
+
+    if (page_ref(old_page) == 1) {
+        /* Nobody else sees this page: permission restoration is sufficient. */
+        *ptep = pte_create(page2ppn(old_page), perm);
+        tlb_invalidate(mm->pgdir, va);
+        ret = 0;
+        goto out;
+    }
+
+    struct Page *new_page = alloc_page();
+    if (new_page == NULL) {
+        ret = -E_NO_MEM;
+        goto out;
+    }
+
+    memcpy(page2kva(new_page), page2kva(old_page), PGSIZE);
+    /* page_insert acquires the new reference and drops the old one. */
+    ret = page_insert(mm->pgdir, new_page, va, perm);
+    if (ret != 0) {
+        free_page(new_page);
+    }
+
+out:
+    local_intr_restore(intr_flag);
+    return ret;
+}
+
+//lab5 function3 YOUR CODE
+// dup_mmap is implemented by B; ordinary user fork should request COW sharing.
 
 void exit_mmap(struct mm_struct *mm)
 {
     assert(mm != NULL && mm_count(mm) == 0);
     pde_t *pgdir = mm->pgdir;
-    list_entry_t *list = &(mm->mmap_list), *le = list;
-    while ((le = list_next(le)) != list)
-    {
-        struct vma_struct *vma = le2vma(le, list_link);
-        unmap_range(pgdir, vma->vm_start, vma->vm_end);
+    if (pgdir == NULL) {
+        return;
     }
-    while ((le = list_next(le)) != list)
-    {
-        struct vma_struct *vma = le2vma(le, list_link);
-        exit_range(pgdir, vma->vm_start, vma->vm_end);
-    }
+
+    /* COW Challenge 2411033: release mappings before private page tables.
+     * Scan the entire user window so partially built mappings/page tables
+     * from a failed fork or exec are not dependent on VMA insertion order.
+     * Kernel mappings and the root page itself are owned by other paths.
+     */
+    unmap_range(pgdir, USERBASE, USERTOP);
+    exit_range(pgdir, USERBASE, USERTOP);
 }
 
 bool copy_from_user(struct mm_struct *mm, void *dst, const void *src, size_t len, bool writable)
@@ -235,12 +294,78 @@ bool copy_from_user(struct mm_struct *mm, void *dst, const void *src, size_t len
 
 bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len)
 {
-    if (!user_mem_check(mm, (uintptr_t)dst, len, 1))
-    {
+    if (len == 0) {
+        return 1;
+    }
+
+    /* Preserve the existing trusted-kernel-address case. */
+    if (mm == NULL) {
+        if (!user_mem_check(NULL, (uintptr_t)dst, len, 1)) {
+            return 0;
+        }
+        memcpy(dst, src, len);
+        return 1;
+    }
+    if (mm->pgdir == NULL) {
         return 0;
     }
-    memcpy(dst, src, len);
-    return 1;
+
+    /* COW Challenge 2411033: the current lab uses one hart. Keep the PTEs
+     * stable from validation through the physical-alias writes below.
+     */
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    bool ret = 0;
+    uintptr_t addr = (uintptr_t)dst;
+    if (!user_mem_check(mm, addr, len, 1)) {
+        goto out;
+    }
+
+    uintptr_t end = addr + len;
+    const pte_t required = PTE_V | PTE_U | PTE_R | PTE_W;
+
+    /* Prepare every destination page before copying any bytes. Failure may
+     * leave some pages private, but leaves the destination contents intact.
+     */
+    for (uintptr_t cur = addr; cur < end;
+         cur = ROUNDDOWN(cur, PGSIZE) + PGSIZE) {
+        pte_t *ptep = get_pte(mm->pgdir, cur, 0);
+        if (ptep == NULL) {
+            goto out;
+        }
+        if ((*ptep & PTE_COW) && do_cow_fault(mm, cur) != 0) {
+            goto out;
+        }
+        if ((*ptep & required) != required || (*ptep & PTE_COW)) {
+            goto out;
+        }
+    }
+
+    const char *from = src;
+    while (addr < end) {
+        pte_t *ptep = get_pte(mm->pgdir, addr, 0);
+        size_t count = PGSIZE - PGOFF(addr);
+        if (count > end - addr) {
+            count = end - addr;
+        }
+
+        /* Physical aliases also work when mm is not the active address
+         * space. The permission/COW checks above must precede these writes.
+         */
+        char *to = (char *)page2kva(pte2page(*ptep)) + PGOFF(addr);
+        if ((*ptep & (PTE_A | PTE_D)) != (PTE_A | PTE_D)) {
+            *ptep |= PTE_A | PTE_D;
+            tlb_invalidate(mm->pgdir, addr);
+        }
+        memcpy(to, from, count);
+        from += count;
+        addr += count;
+    }
+    ret = 1;
+
+out:
+    local_intr_restore(intr_flag);
+    return ret;
 }
 
 // vmm_init - initialize virtual memory management
