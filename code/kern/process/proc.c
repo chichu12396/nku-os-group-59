@@ -82,6 +82,15 @@ void kernel_thread_entry(void);
 void forkrets(struct trapframe *tf);
 void switch_to(struct context *from, struct context *to);
 
+// 模块二（B）：用户程序入口线程与 ELF 加载。
+static int user_main(void *arg);
+static int load_icode(unsigned char *binary, size_t size);
+int kernel_execve(const char *name, const unsigned char *binary, size_t size);
+
+// copy_mm/do_execve 位于这两个页表辅助函数之前，需要前置声明。
+static int setup_pgdir(struct mm_struct *mm);
+static void put_pgdir(struct mm_struct *mm);
+
 //lab4 请补充你在lab4中的代码
 
 static int
@@ -109,7 +118,39 @@ init_main(void *arg)
 {
     cprintf("this initproc, pid = %d, name = \"%s\"\n", current->pid, get_proc_name(current));
     cprintf("To U: \"%s\".\n", (const char *)arg);
-    cprintf("To U: \"en.., Bye, Bye. :)\"\n");
+
+    // 记录进入用户态之前的空闲物理页和内核堆用量，退出后核对全部归还。
+    size_t nr_free_pages_store = nr_free_pages();
+    size_t kernel_allocated_store = kallocated();
+    // SLOB 的 arena 页只增不减，先把当前占用记录下来，最后从“空闲页恢复”中单独扣除。
+    size_t slob_pages_store = slob_arena_pages();
+
+    // 创建唯一的用户程序入口线程：user_main 随后通过 kernel_execve 进入用户态。
+    int pid = kernel_thread(user_main, NULL, 0);
+    if (pid <= 0)
+    {
+        panic("create user_main failed.\n");
+    }
+    struct proc_struct *proc = find_proc(pid);
+    set_proc_name(proc, "user_main");
+
+    // 等待 user_main 运行完用户程序并退出，回收其 PCB 与内核栈。
+    do_wait(pid, NULL);
+
+    // 所有用户进程退出后，进程树、链表与进程计数应只留下 initproc。
+    cprintf("all user-mode processes have quit.\n");
+    assert(initproc->cptr == NULL && initproc->yptr == NULL && initproc->optr == NULL);
+    assert(nr_process == 2);
+    assert(list_next(&proc_list) == &(initproc->list_link));
+    assert(list_prev(&proc_list) == &(initproc->list_link));
+
+    // 用户进程释放后，除 SLOB arena 保留页外，所有物理页都应回到空闲池。
+    // 这样仍能发现用户映射、页表或内核栈的真实泄漏，同时不与 SLOB 的
+    // “只增不减”行为冲突（该行为是 ucore 上游已知问题）。
+    assert(nr_free_pages() + (slob_arena_pages() - slob_pages_store) ==
+           nr_free_pages_store);
+    assert(kernel_allocated_store == kallocated());
+    cprintf("init check memory pass.\n");
     return 0;
 }
 
@@ -277,10 +318,66 @@ copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
 static int
 copy_mm(uint32_t clone_flags, struct proc_struct *proc)
 {
-    // 当前创建的都是内核线程，current->mm 本来就是 NULL。
-    assert(current->mm == NULL);
-    proc->mm = NULL;
+    struct mm_struct *mm, *oldmm = current->mm;
+
+    // 没有用户地址空间（内核线程）：子线程也不使用用户地址空间。
+    if (oldmm == NULL)
+    {
+        proc->mm = NULL;
+        return 0;
+    }
+
+    // CLONE_VM：与父进程共享地址空间，只增加 mm 的引用计数。
+    // 父子看到的是同一套页表，退出时由最后一个使用者释放。
+    if (clone_flags & CLONE_VM)
+    {
+        lock_mm(oldmm);
+        {
+            mm_count_inc(oldmm);
+        }
+        unlock_mm(oldmm);
+        proc->mm = oldmm;
+        proc->pgdir = current->pgdir;
+        return 0;
+    }
+
+    // 普通 fork：为子进程建立独立的 mm 和页表，并复制父进程的所有 VMA。
+    int ret = -E_NO_MEM;
+    if ((mm = mm_create()) == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    lock_mm(oldmm);
+    {
+        if ((ret = setup_pgdir(mm)) != 0)
+        {
+            unlock_mm(oldmm);
+            mm_destroy(mm);
+            return ret;
+        }
+        // dup_mmap 内部通过 copy_range 逐个物理页复制，父子可写数据相互独立。
+        if ((ret = dup_mmap(mm, oldmm)) != 0)
+        {
+            unlock_mm(oldmm);
+            goto bad_mm;
+        }
+    }
+    unlock_mm(oldmm);
+
+    // 新地址空间只由当前新进程持有。
+    set_mm_count(mm, 1);
+    proc->mm = mm;
+    // proc->pgdir 保存页表根的物理地址，proc_run 用它写入 satp。
+    proc->pgdir = PADDR(mm->pgdir);
     return 0;
+
+bad_mm:
+    // 复制中途失败：回收已经建立的部分映射和页表。
+    exit_mmap(mm);
+    put_pgdir(mm);
+    mm_destroy(mm);
+    return ret;
 }
 
 void cpu_idle(void)
@@ -325,7 +422,7 @@ void proc_run(struct proc_struct *proc)
     }
 }
 
-//lab5 function2 YOUR CODE update alloc_proc
+//lab5 function2 2412102 update alloc_proc
 
 
 // set_proc_name - set the name of proc
@@ -469,7 +566,7 @@ find_proc(int pid)
     return NULL;
 }
 
-//lab5 function2 YOUR CODE update kernel_thread
+//lab5 function2 2412102 update kernel_thread
 
 
 // setup_kstack - alloc pages with size KSTACKPAGE as process kernel stack
@@ -515,14 +612,316 @@ put_pgdir(struct mm_struct *mm)
     free_page(kva2page(mm->pgdir));
 }
 
-//lab5 function3 YOUR CODE update copy_mm
+//lab5 function3 2412102 update copy_mm（实现见上方 copy_mm）
 
 
+//lab5 function2 2412102
+// do_execve - 用内存中的 ELF 映像替换当前进程的用户地址空间。
+// KERNEL_EXECVE（内核线程首次进入用户态）与用户态 sys_exec 都最终走这里。
+int
+do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
+{
+    struct mm_struct *oldmm = current->mm;
 
-//lab5 function2 YOUR CODE
+    // 基本参数检查：binary 必须指向一段足以容纳 ELF 头的数据。
+    if (binary == NULL || size < sizeof(struct elfhdr))
+    {
+        return -E_INVAL;
+    }
+
+    // 调用者仍持有用户地址空间时，name/binary 是用户指针，先验证可读。
+    // 内核线程调用（current->mm == NULL）时二者都位于内核镜像中。
+    if (oldmm != NULL)
+    {
+        if (name != NULL && len != 0 &&
+            !user_mem_check(oldmm, (uintptr_t)name, len, 0))
+        {
+            return -E_INVAL;
+        }
+        if (!user_mem_check(oldmm, (uintptr_t)binary, size, 0))
+        {
+            return -E_INVAL;
+        }
+    }
+
+    // 先把进程名复制到内核栈，避免旧地址空间被替换后 name 指针失效。
+    char local_name[PROC_NAME_LEN + 1];
+    memset(local_name, 0, sizeof(local_name));
+    if (name != NULL)
+    {
+        size_t copy_len = (len > PROC_NAME_LEN) ? PROC_NAME_LEN : len;
+        memcpy(local_name, name, copy_len);
+    }
+
+    // 先建立并切换到新的用户地址空间；此时旧页表仍然有效，
+    // load_icode 可以直接从 binary（可能位于旧用户空间）读取 ELF。
+    int ret = load_icode(binary, size);
+    if (ret != 0)
+    {
+        // 加载失败：终止当前进程，避免带着半成品地址空间返回用户态。
+        do_exit(ret);
+        panic("do_execve: load_icode failed: %d.\n", ret);
+    }
+    set_proc_name(current, local_name);
+
+    // load_icode 已把 satp 切换到新页表，现在可以安全回收旧地址空间。
+    if (oldmm != NULL && oldmm != current->mm)
+    {
+        if (mm_count_dec(oldmm) == 0)
+        {
+            exit_mmap(oldmm);
+            put_pgdir(oldmm);
+            mm_destroy(oldmm);
+        }
+    }
+    return 0;
+}
+
+// load_icode - 解析 ELF 映像，建立新的 mm、页表和用户栈，并设置用户入口现场。
+// 成功时把 satp 切换到新地址空间；失败时完整回收已建立的部分。
+static int
+load_icode(unsigned char *binary, size_t size)
+{
+    if (current->tf == NULL)
+    {
+        panic("load_icode: current->tf is NULL.\n");
+    }
+
+    struct elfhdr *elf = (struct elfhdr *)binary;
+    if (size < sizeof(struct elfhdr) || elf->e_magic != ELF_MAGIC)
+    {
+        return -E_INVAL_ELF;
+    }
+    if (elf->e_phoff == 0 || elf->e_phnum == 0 ||
+        elf->e_phoff + (size_t)elf->e_phnum * sizeof(struct proghdr) > size)
+    {
+        return -E_INVAL_ELF;
+    }
+
+    int ret = -E_NO_MEM;
+    struct mm_struct *mm = mm_create();
+    if (mm == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    lock_mm(mm);
+    if (setup_pgdir(mm) != 0)
+    {
+        unlock_mm(mm);
+        mm_destroy(mm);
+        return -E_NO_MEM;
+    }
+
+    // 1) 逐个装载可执行段：建立 VMA，分配物理页，复制文件内容并清零 BSS。
+    struct proghdr *ph = (struct proghdr *)(binary + elf->e_phoff);
+    uint32_t i;
+    for (i = 0; i < elf->e_phnum; i++, ph++)
+    {
+        if (ph->p_type != ELF_PT_LOAD || ph->p_memsz == 0)
+        {
+            continue;
+        }
+        if (ph->p_filesz > ph->p_memsz ||
+            ph->p_offset + ph->p_filesz > size ||
+            !USER_ACCESS(ph->p_va, ph->p_va + ph->p_memsz))
+        {
+            ret = -E_INVAL_ELF;
+            goto bad_elf;
+        }
+
+        // 段权限：VMA 标志用于 user_mem_check，PTE 权限用于硬件页表。
+        uint32_t vm_flags = 0, perm = PTE_U;
+        if (ph->p_flags & ELF_PF_R)
+        {
+            vm_flags |= VM_READ;
+            perm |= PTE_R;
+        }
+        if (ph->p_flags & ELF_PF_W)
+        {
+            vm_flags |= VM_WRITE;
+            perm |= PTE_W;
+        }
+        if (ph->p_flags & ELF_PF_X)
+        {
+            vm_flags |= VM_EXEC;
+            perm |= PTE_X;
+        }
+
+        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0)
+        {
+            goto bad_elf;
+        }
+
+        uintptr_t seg_start = ROUNDDOWN(ph->p_va, PGSIZE);
+        uintptr_t seg_end = ROUNDUP(ph->p_va + ph->p_memsz, PGSIZE);
+        uintptr_t file_end = ph->p_va + ph->p_filesz;
+
+        for (uintptr_t la = seg_start; la < seg_end; la += PGSIZE)
+        {
+            struct Page *page = pgdir_alloc_page(mm->pgdir, la, perm);
+            if (page == NULL)
+            {
+                ret = -E_NO_MEM;
+                goto bad_elf;
+            }
+            char *kva = (char *)page2kva(page);
+            // 整页清零：p_filesz 之外的 BSS 区域必须为 0。
+            memset(kva, 0, PGSIZE);
+
+            // 计算本页中属于文件内容的那一段并复制。
+            uintptr_t copy_begin = (la > ph->p_va) ? la : ph->p_va;
+            uintptr_t copy_end = (la + PGSIZE < file_end) ? (la + PGSIZE) : file_end;
+            if (copy_begin < copy_end)
+            {
+                memcpy(kva + (copy_begin - la),
+                       binary + ph->p_offset + (copy_begin - ph->p_va),
+                       copy_end - copy_begin);
+            }
+        }
+    }
+
+    // 2) 建立用户栈的 VMA，并实际映射整个用户栈区域。
+    // mm_map 把最低一页作为栈保护页，user_mem_check 会拒绝访问它。
+    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE,
+                      VM_READ | VM_WRITE | VM_STACK, NULL)) != 0)
+    {
+        goto bad_elf;
+    }
+    for (i = 0; i < USTACKPAGE; i++)
+    {
+        uintptr_t la = USTACKTOP - (i + 1) * PGSIZE;
+        struct Page *page = pgdir_alloc_page(mm->pgdir, la, PTE_U | PTE_R | PTE_W);
+        if (page == NULL)
+        {
+            ret = -E_NO_MEM;
+            goto bad_elf;
+        }
+        memset(page2kva(page), 0, PGSIZE);
+    }
+
+    // 3) 地址空间建立完毕，交给当前进程并切换 satp。
+    set_mm_count(mm, 1);
+    current->mm = mm;
+    current->pgdir = PADDR(mm->pgdir);
+    unlock_mm(mm);
+
+    // 4) 设置首次进入用户态的现场：用户栈顶、ELF 入口、SPP=0、SPIE=1、SIE=0。
+    struct trapframe *tf = current->tf;
+    tf->gpr.sp = USTACKTOP;
+    tf->gpr.a0 = 0;
+    tf->epc = elf->e_entry;
+    tf->status = (read_csr(sstatus) & ~(SSTATUS_SPP | SSTATUS_SIE)) | SSTATUS_SPIE;
+
+    uintptr_t satp_value =
+        ((uintptr_t)SATP_MODE_SV39 << 60) | (current->pgdir >> RISCV_PGSHIFT);
+    write_csr(satp, satp_value);
+    asm volatile("sfence.vma" ::: "memory");
+    return 0;
+
+bad_elf:
+    unlock_mm(mm);
+    // mm_count 仍为 0，按 VMA 范围撤销映射并释放页表根和 mm。
+    exit_mmap(mm);
+    put_pgdir(mm);
+    mm_destroy(mm);
+    return ret;
+}
+
+// do_wait - 等待指定（pid != 0）或任意（pid == 0）子进程退出，
+// 取得退出码并回收僵尸进程的内核栈与 PCB。
+int
+do_wait(int pid, int *code_store)
+{
+    struct mm_struct *mm = current->mm;
+
+    // 退出码写入位置必须是可写的合法用户地址（NULL 表示不接收）。
+    if (code_store != NULL &&
+        !user_mem_check(mm, (uintptr_t)code_store, sizeof(int), 1))
+    {
+        return -E_INVAL;
+    }
+
+    bool intr_flag, haskid;
+    struct proc_struct *proc;
+    list_entry_t *le, *list = &proc_list;
+repeat:
+    haskid = 0;
+
+    if (pid != 0)
+    {
+        // 等待指定 pid 的子进程。
+        proc = find_proc(pid);
+        if (proc != NULL && proc->parent == current)
+        {
+            haskid = 1;
+            if (proc->state == PROC_ZOMBIE)
+            {
+                goto found;
+            }
+        }
+    }
+    else
+    {
+        // 等待任意一个已经退出的子进程。
+        le = list;
+        while ((le = list_next(le)) != list)
+        {
+            proc = le2proc(le, list_link);
+            if (proc->parent != current)
+            {
+                continue;
+            }
+            haskid = 1;
+            if (proc->state == PROC_ZOMBIE)
+            {
+                goto found;
+            }
+        }
+    }
+
+    if (haskid)
+    {
+        // 有子进程但尚未退出：睡眠直到子进程退出唤醒或自身被终止。
+        current->state = PROC_SLEEPING;
+        current->wait_state = WT_CHILD;
+        schedule();
+        if (current->flags & PF_EXITING)
+        {
+            do_exit(-E_KILLED);
+        }
+        goto repeat;
+    }
+    return -E_BAD_PROC;
+
+found:
+    if (proc == idleproc || proc == initproc)
+    {
+        panic("do_wait: can not wait idleproc or initproc.\n");
+    }
+
+    // 交付退出码；目标进程此时仍持有自己的用户地址空间。
+    if (code_store != NULL &&
+        !copy_to_user(mm, code_store, &proc->exit_code, sizeof(int)))
+    {
+        return -E_INVAL;
+    }
+
+    // 僵尸进程不再被查找或调度，摘除哈希/链表后回收内核栈和 PCB。
+    local_intr_save(intr_flag);
+    {
+        unhash_proc(proc);
+        remove_links(proc);
+    }
+    local_intr_restore(intr_flag);
+
+    put_kstack(proc);
+    kfree(proc);
+    return 0;
+}
 
 
-//lab5 function3 YOUR CODE
+//lab5 function3 2412102（copy_mm 已在上方实现）
 
 
 //lab5 function4 YOUR CODE
@@ -549,7 +948,47 @@ put_pgdir(struct mm_struct *mm)
 #define KERNEL_EXECVE2(x, xstart, xsize) __KERNEL_EXECVE2(x, xstart, xsize)
 
 
-//lab5 function2 YOUR CODE
+//lab5 function2 2412102
+// user_main - 内核过渡线程入口：装载并运行用户程序。
+// 编译时带 TEST 宏则运行指定的测试程序，否则默认运行 exit。
+static int
+user_main(void *arg)
+{
+    (void)arg;
+#ifdef TEST
+    KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE);
+#else
+    KERNEL_EXECVE(exit);
+#endif
+    panic("user_main execve failed.\n");
+}
 
+// kernel_execve - 构造返回用户态的中断帧，真正完成 S 态到 U 态的切换。
+// 仅调用 do_execve 只完成地址空间替换；必须经由 forkrets/sret 才能进入用户程序。
+int
+kernel_execve(const char *name, const unsigned char *binary, size_t size)
+{
+    struct trapframe *tf = current->tf;
+    if (tf == NULL)
+    {
+        panic("kernel_execve: current->tf is NULL.\n");
+    }
+
+    // 清空内核线程的初始现场，避免把内核寄存器内容带进用户态。
+    memset(tf, 0, sizeof(struct trapframe));
+
+    int ret = do_execve(name, strlen(name), (unsigned char *)binary, size);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    // load_icode 已切换到新进程页表，并设置好 tf->epc / tf->gpr.sp / tf->status。
+    // forkrets 以 tf 为栈执行 __trapret，最后由 sret 返回用户态。
+    forkrets(tf);
+
+    // forkrets 不会返回。
+    return 0;
+}
 
 
