@@ -384,7 +384,63 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 }
 
 
-//lab5 function3 YOUR CODE 
+//lab5 function3 2412102
+// copy_range - 把 from 页表中 [start, end) 的有效用户映射逐页复制到 to。
+// 普通 fork 采用 eager copy：每页分配新物理页并复制内容，父子相互独立。
+// share=true 预留给 COW 扩展；本基线始终执行真实复制。
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+
+    (void)share; // 普通 fork 基线不使用共享路径
+
+    while (start < end)
+    {
+        pte_t *ptep = get_pte(from, start, 0);
+        if (ptep == NULL)
+        {
+            // 该 2 MiB 区间没有页表，直接跳过。
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+
+        if (*ptep & PTE_V)
+        {
+            pte_t *nptep = get_pte(to, start, 1);
+            if (nptep == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            if (*nptep != 0)
+            {
+                // 目标地址已被映射，说明调用参数不一致。
+                return -E_INVAL;
+            }
+
+            // 沿用源页的权限位（R/W/X/U/A/D）。
+            uint32_t perm = (uint32_t)(*ptep & 0x3FF);
+            struct Page *page = pte2page(*ptep);
+
+            struct Page *npage = alloc_page();
+            if (npage == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            memcpy(page2kva(npage), page2kva(page), PGSIZE);
+
+            // page_insert 负责把新页映射到子页表并增加引用计数。
+            if (page_insert(to, npage, start, perm) != 0)
+            {
+                free_page(npage);
+                return -E_NO_MEM;
+            }
+        }
+        start += PGSIZE;
+    }
+    return 0;
+}
 
 
 //lab4 请补充你在lab4中的代码
