@@ -76,6 +76,8 @@ typedef struct bigblock bigblock_t;
 static slob_t arena = {.next = &arena, .units = 1};
 static slob_t *slobfree = &arena;
 static bigblock_t *bigblocks;
+// SLOB 的 arena 只增不减：记录它从 pmm 拿走且不会归还的页数。
+static size_t slob_arena_page_count = 0;
 
 static void *__slob_get_free_pages(gfp_t gfp, int order)
 {
@@ -147,6 +149,7 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align)
 			cur = (slob_t *)__slob_get_free_page(gfp);
 			if (!cur)
 				return 0;
+			slob_arena_page_count++;
 
 			slob_free(cur, PAGE_SIZE);
 			spin_lock_irqsave(&slob_lock, flags);
@@ -215,6 +218,12 @@ size_t
 kallocated(void)
 {
 	return slob_allocated();
+}
+
+size_t
+slob_arena_pages(void)
+{
+	return slob_arena_page_count;
 }
 
 static int find_order(int size)

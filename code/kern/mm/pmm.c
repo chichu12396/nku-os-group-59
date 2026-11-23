@@ -390,96 +390,58 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 }
 
 
-//lab5 function3 2411033
-
-// COW Challenge 2411033: ordinary private copy and optional COW sharing.
-int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+//lab5 function3 2412102
+// copy_range - 把 from 页表中 [start, end) 的有效用户映射逐页复制到 to。
+// 普通 fork 采用 eager copy：每页分配新物理页并复制内容，父子相互独立。
+// share=true 预留给 COW 扩展；本基线始终执行真实复制。
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
-    if (to == NULL || from == NULL || to == from) {
-        return -E_INVAL;
-    }
 
-    while (start < end) {
-        /* Single-hart critical section; no process is scheduled here. */
-        bool intr_flag;
-        local_intr_save(intr_flag);
-        int ret = 0;
+    (void)share; // 普通 fork 基线不使用共享路径
 
-        pte_t *src = get_pte(from, start, 0);
-        if (src == NULL) {
-            /* No lowest-level page table: skip this 2 MiB interval. */
-            local_intr_restore(intr_flag);
+    while (start < end)
+    {
+        pte_t *ptep = get_pte(from, start, 0);
+        if (ptep == NULL)
+        {
+            // 该 2 MiB 区间没有页表，直接跳过。
             start = ROUNDDOWN(start + PTSIZE, PTSIZE);
             continue;
         }
-        if (!(*src & PTE_V)) {
-            local_intr_restore(intr_flag);
-            start += PGSIZE;
-            continue;
-        }
 
-        uint32_t perm = (uint32_t)(*src & 0x3FF);
-        /* This interface copies 4 KiB user leaf mappings only. */
-        if (!(perm & PTE_U) || !(perm & (PTE_R | PTE_X)) ||
-            ((perm & PTE_W) && !(perm & PTE_R))) {
-            ret = -E_INVAL;
-            goto page_out;
-        }
+        if (*ptep & PTE_V)
+        {
+            pte_t *nptep = get_pte(to, start, 1);
+            if (nptep == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            if (*nptep != 0)
+            {
+                // 目标地址已被映射，说明调用参数不一致。
+                return -E_INVAL;
+            }
 
-        pte_t *dst = get_pte(to, start, 1);
-        if (dst == NULL) {
-            ret = -E_NO_MEM;
-            goto page_out;
-        }
-        if (*dst != 0) {
-            ret = -E_INVAL;
-            goto page_out;
-        }
+            // 沿用源页的权限位（R/W/X/U/A/D）。
+            uint32_t perm = (uint32_t)(*ptep & 0x3FF);
+            struct Page *page = pte2page(*ptep);
 
-        struct Page *page = pte2page(*src);
-        if (share) {
-            /* Repeated fork must preserve an existing COW marker. Truly
-             * read-only pages are shared without ever gaining that marker.
-             */
-            if (perm & (PTE_W | PTE_COW)) {
-                perm = (perm & ~PTE_W) | PTE_COW;
+            struct Page *npage = alloc_page();
+            if (npage == NULL)
+            {
+                return -E_NO_MEM;
             }
-            /* Publish the child mapping before restricting the parent.
-             * Failure leaves this parent PTE unchanged. page_insert itself
-             * increments the shared page's reference count exactly once.
-             */
-            ret = page_insert(to, page, start, perm);
-            if (ret == 0 && *src != pte_create(page2ppn(page), perm)) {
-                *src = pte_create(page2ppn(page), perm);
-                tlb_invalidate(from, start);
-            }
-        }
-        else {
-            /* An eager copy of a COW page is privately writable again. */
-            if (perm & PTE_COW) {
-                perm = (perm | PTE_W) & ~PTE_COW;
-            }
-            struct Page *new_page = alloc_page();
-            if (new_page == NULL) {
-                ret = -E_NO_MEM;
-                goto page_out;
-            }
-            memcpy(page2kva(new_page), page2kva(page), PGSIZE);
-            ret = page_insert(to, new_page, start, perm);
-            if (ret != 0) {
-                free_page(new_page);
-            }
-        }
+            memcpy(page2kva(npage), page2kva(page), PGSIZE);
 
-page_out:
-        local_intr_restore(intr_flag);
-        if (ret != 0) {
-            /* The caller owns partial-child cleanup. Remaining parent COW
-             * mappings stay valid, including the single-reference case.
-             */
-            return ret;
+            // page_insert 负责把新页映射到子页表并增加引用计数。
+            if (page_insert(to, npage, start, perm) != 0)
+            {
+                free_page(npage);
+                return -E_NO_MEM;
+            }
         }
         start += PGSIZE;
     }

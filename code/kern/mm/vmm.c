@@ -235,6 +235,47 @@ int do_cow_fault(struct mm_struct *mm, uintptr_t addr)
 
     uint32_t perm = (uint32_t)(*ptep & 0x3FF);
     perm = (perm | PTE_W | PTE_A | PTE_D) & ~PTE_COW;
+//lab5 function3 2412102
+// dup_mmap - 把 from 的每个 VMA（区间和属性）复制到 to，并调用 copy_range
+// 为子进程建立独立的物理页映射。
+int
+dup_mmap(struct mm_struct *to, struct mm_struct *from)
+{
+    assert(to != NULL && from != NULL);
+
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        list_entry_t *list = &(from->mmap_list), *le = list;
+        while ((le = list_next(le)) != list)
+        {
+            struct vma_struct *vma = le2vma(le, list_link);
+
+            // 先复制 VMA 元数据，保证失败时 to 仍能按 VMA 范围清理。
+            struct vma_struct *nvma =
+                vma_create(vma->vm_start, vma->vm_end, vma->vm_flags);
+            if (nvma == NULL)
+            {
+                local_intr_restore(intr_flag);
+                return -E_NO_MEM;
+            }
+            insert_vma_struct(to, nvma);
+
+            // 普通 fork 使用 eager copy，父子可写数据相互独立。
+            // COW Challenge 在此处改传 share=true，共享物理页。
+            bool share = 0;
+            int ret = copy_range(to->pgdir, from->pgdir,
+                                 vma->vm_start, vma->vm_end, share);
+            if (ret != 0)
+            {
+                local_intr_restore(intr_flag);
+                return ret;
+            }
+        }
+    }
+    local_intr_restore(intr_flag);
+    return 0;
+}
 
     if (page_ref(old_page) == 1) {
         /* Nobody else sees this page: permission restoration is sufficient. */
