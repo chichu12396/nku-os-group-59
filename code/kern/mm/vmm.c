@@ -235,6 +235,33 @@ int do_cow_fault(struct mm_struct *mm, uintptr_t addr)
 
     uint32_t perm = (uint32_t)(*ptep & 0x3FF);
     perm = (perm | PTE_W | PTE_A | PTE_D) & ~PTE_COW;
+
+    if (page_ref(old_page) == 1) {
+        /* Nobody else sees this page: permission restoration is sufficient. */
+        *ptep = pte_create(page2ppn(old_page), perm);
+        tlb_invalidate(mm->pgdir, va);
+        ret = 0;
+        goto out;
+    }
+
+    struct Page *new_page = alloc_page();
+    if (new_page == NULL) {
+        ret = -E_NO_MEM;
+        goto out;
+    }
+
+    memcpy(page2kva(new_page), page2kva(old_page), PGSIZE);
+    /* page_insert acquires the new reference and drops the old one. */
+    ret = page_insert(mm->pgdir, new_page, va, perm);
+    if (ret != 0) {
+        free_page(new_page);
+    }
+
+out:
+    local_intr_restore(intr_flag);
+    return ret;
+}
+
 //lab5 function3 2412102
 // dup_mmap - 把 from 的每个 VMA（区间和属性）复制到 to，并调用 copy_range
 // 为子进程建立独立的物理页映射。
@@ -275,32 +302,6 @@ dup_mmap(struct mm_struct *to, struct mm_struct *from)
     }
     local_intr_restore(intr_flag);
     return 0;
-}
-
-    if (page_ref(old_page) == 1) {
-        /* Nobody else sees this page: permission restoration is sufficient. */
-        *ptep = pte_create(page2ppn(old_page), perm);
-        tlb_invalidate(mm->pgdir, va);
-        ret = 0;
-        goto out;
-    }
-
-    struct Page *new_page = alloc_page();
-    if (new_page == NULL) {
-        ret = -E_NO_MEM;
-        goto out;
-    }
-
-    memcpy(page2kva(new_page), page2kva(old_page), PGSIZE);
-    /* page_insert acquires the new reference and drops the old one. */
-    ret = page_insert(mm->pgdir, new_page, va, perm);
-    if (ret != 0) {
-        free_page(new_page);
-    }
-
-out:
-    local_intr_restore(intr_flag);
-    return ret;
 }
 
 //lab5 function3 YOUR CODE
