@@ -108,10 +108,6 @@ copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
 static int
 copy_mm(uint32_t clone_flags, struct proc_struct *proc);
 static void set_links(struct proc_struct *proc);
-int do_exit(int error_code)
-{
-    panic("process exit!!.\n");
-}
 
 static int
 init_main(void *arg)
@@ -924,7 +920,128 @@ found:
 //lab5 function3 2412102（copy_mm 已在上方实现）
 
 
-//lab5 function4 YOUR CODE
+//lab5 function4 2413346
+// do_exit - 当前进程退出：释放用户地址空间，进入僵尸态，唤醒父进程，
+//           把仍在运行的子进程托管给 initproc，最后交出 CPU。
+// 注意：PCB 和内核栈不在这里释放。退出代码本身仍运行在自己的内核栈上，
+// 这两项必须由父进程在 do_wait 中回收。
+int do_exit(int error_code)
+{
+    // idleproc 和 initproc 是内核常驻进程：前者是调度兜底线程，后者负责
+    // 回收整棵用户进程树。它们一旦退出，系统将失去收尾能力，因此直接 panic，
+    // 与内核线程入口 kernel_thread_entry 在 fn 返回后调用 do_exit 的约定一致。
+    if (current == idleproc)
+    {
+        panic("idleproc exit.\n");
+    }
+    if (current == initproc)
+    {
+        panic("initproc exit.\n");
+    }
+
+    struct mm_struct *mm = current->mm;
+    if (mm != NULL)
+    {
+        // 1) 先把 satp 切回内核启动页表，再回收用户地址空间。
+        //    否则释放页表根之后，CPU 仍可能通过 satp 引用已释放的物理页。
+        uintptr_t satp_value =
+            ((uintptr_t)SATP_MODE_SV39 << 60) |
+            (boot_pgdir_pa >> RISCV_PGSHIFT);
+        write_csr(satp, satp_value);
+        asm volatile("sfence.vma" ::: "memory");
+
+        current->mm = NULL;
+        current->pgdir = boot_pgdir_pa;
+
+        // 2) mm_count 归零才真正释放；CLONE_VM 的兄弟进程仍在使用时只减计数。
+        //    exit_mmap 内部断言 mm_count == 0，因此必须先减再调用。
+        if (mm_count_dec(mm) == 0)
+        {
+            exit_mmap(mm);
+            put_pgdir(mm);
+            mm_destroy(mm);
+        }
+    }
+
+    // 3) 记录退出码并进入僵尸态，等待父进程 do_wait 取走退出码后回收 PCB。
+    current->exit_code = error_code;
+    current->state = PROC_ZOMBIE;
+
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        // 4) 父进程若正睡在 WT_CHILD 上，唤醒它来完成回收。
+        //    退出码和僵尸态已经写好，父进程醒来即可在 do_wait 中找到自己。
+        struct proc_struct *parent = current->parent;
+        if (parent != NULL && parent->wait_state == WT_CHILD)
+        {
+            wakeup_proc(parent);
+        }
+
+        // 5) 把自己名下的子进程全部转交 initproc，避免出现无人回收的孤儿分支。
+        //    沿用 set_links 的兄弟链语义：cptr 指向最新（链头）的子进程，
+        //    optr 指向更年长的兄弟，yptr 指回更年轻的兄弟。
+        struct proc_struct *p;
+        while ((p = current->cptr) != NULL)
+        {
+            // 从 current 的子进程链表头摘下 p。
+            current->cptr = p->optr;
+            if (current->cptr != NULL)
+            {
+                current->cptr->yptr = NULL;
+            }
+            p->optr = p->yptr = NULL;
+
+            // 挂到 initproc 的子进程链表头，关系维护与 set_links 保持一致。
+            p->parent = initproc;
+            p->optr = initproc->cptr;
+            if (p->optr != NULL)
+            {
+                p->optr->yptr = p;
+            }
+            initproc->cptr = p;
+        }
+    }
+    local_intr_restore(intr_flag);
+
+    // 6) 僵尸进程不再参与调度，立即让出 CPU，由调度器选择下一个合法线程。
+    schedule();
+    panic("do_exit will not return!!\n");
+}
+
+// do_yield - 主动让出 CPU：只提出重调度请求，真正的切换由 trap 返回路径完成。
+// 用户态 sys_yield -> trap() 在返回用户态前检查 need_resched 并调用 schedule，
+// 因此这里不直接调用 schedule，避免在系统调用中途切走当前内核栈。
+int do_yield(void)
+{
+    current->need_resched = 1;
+    return 0;
+}
+
+// do_kill - 向目标进程发送退出意图。
+// 只设置 PF_EXITING，目标进程在下次从用户态返回、或从睡眠中被唤醒时自行进入 do_exit。
+int do_kill(int pid)
+{
+    struct proc_struct *proc = find_proc(pid);
+
+    // 非法 pid、内核常驻进程、已经进入退出流程或已经僵死的目标都拒绝。
+    if (proc == NULL || proc == idleproc || proc == initproc ||
+        (proc->flags & PF_EXITING) || proc->state == PROC_ZOMBIE)
+    {
+        return -E_INVAL;
+    }
+
+    proc->flags |= PF_EXITING;
+
+    // 睡眠中的进程不会自己回到 trap 返回路径，需要唤醒后由 do_wait 中的
+    // PF_EXITING 检查把它送进 do_exit。
+    if (proc->state == PROC_SLEEPING)
+    {
+        wakeup_proc(proc);
+    }
+
+    return 0;
+}
 
 
 #define __KERNEL_EXECVE(name, binary, size) ({           \
