@@ -85,85 +85,117 @@ Case 2：非叶项继续向下查，叶项直接输出，包括高层大页映�
 
 ````
 
-# B 模块最终提示词
+### 功能模块：模块二、三——用户程序创建与加载、用户进程复制
 
-> 说明：下面是实际用于生成本次 Lab5 模块二、模块三代码的有效提示词版本。
-> 使用时把“现有代码约束”一节中的文件一并提供给模型，并要求只输出待填区域的完整函数。
+**负责人：** 2412102-聂海丽
+#### 最终提示词
 
----
+以下是最终使用的提示词：
 
-## 角色与目标
+````markdown
+[PROMPT]
+我正在实现 RISC-V ucore Lab5 的功能模块二：用户程序创建与加载，以及功能模块三：用户进程复制。请在独立副本中修改 kern/process/proc.c、kern/mm/vmm.c 和 kern/mm/pmm.c，把 B 负责的 //lab5 function2、function3 区域接通。
 
-你是操作系统内核开发者。请在一个基于 RISC-V Sv39、已经完成 Lab2（物理内存）、Lab3（中断/异常返回）、Lab4（PCB、调度、`do_fork`/`copy_thread`）的 ucore 教学内核上，完成 Lab5 的**模块二（用户程序创建与加载）**和**模块三（用户进程复制）**。
+实现方式：
+- 先读下面列出的参考文件，使用项目真实的字段、编号和函数签名。
+- 直接修改实际文件，只填写 //lab5 function2、function3 标记的区域，保留 Lab5 标记，把 YOUR CODE 替换为学号 2412102。
+- 复用现有结构、头文件和函数签名，不新增并行接口；不要修改属于其他成员负责的函数、Makefile、用户库和测试。
+- 输出可直接编译的完整函数，不要伪代码；每个函数附简短中文注释，说明关键状态、页表或寄存器处理。
+- 在每个函数末尾说明失败路径会释放哪些资源。
+- 生成后先编译，再运行可用的模块测试与用户程序，记录真实输出；其他模块未完成导致的链接或运行限制单独说明。
+- 使用时把 [RELY] 中列出的参考文件一并提供给模型，并要求只输出待填区域的完整函数。
 
-代码基线：`code/` 目录，Lab5 框架已回填 Lab2–4 的实现，B 负责的 `function2`/`function3` 区域仍是 `YOUR CODE`。
+[RELY]
+可以依赖的东西：
+- 先读 kern/process/proc.c、kern/process/proc.h、kern/process/entry.S、kern/mm/vmm.c、kern/mm/vmm.h、kern/mm/pmm.c、kern/mm/pmm.h、kern/mm/mmu.h、kern/trap/trap.c、kern/trap/trapentry.S、kern/schedule/sched.h、libs/riscv.h、libs/elf.h、libs/error.h 和 tools/test_lab5.c。
+- 代码基线是 code/ 目录：Lab5 框架已回填 Lab2–4 的实现，B 负责的 function2/function3 区域仍为 YOUR CODE。
+- struct proc_struct、struct mm_struct、struct vma_struct、struct trapframe 保持原样；do_execve(const char *name, size_t len, unsigned char *binary, size_t size) 和 copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) 使用现有签名。
+- proc->pgdir 必须保存页表根的物理地址（PADDR(mm->pgdir)），因为 proc_run 直接用它拼 satp；mm->pgdir 是内核虚拟地址。
+- RESTORE_ALL 已由 Lab3 实现：返回用户态时 SPP=0，sscratch 会设为该中断帧之上的内核栈顶。因此首次进入用户态只要保证 tf->status（SPP=0、SPIE=1、SIE=0）、tf->epc、tf->gpr.sp 正确，并调用 forkrets(tf)。
+- 用户程序链接在 0x800020，用户栈顶 USTACKTOP = 0x80000000，USTACKPAGE = 256；栈 VMA 最低页由 user_mem_check 作为保护页。
+- idt_init 已设置 sstatus.SUM，内核可以直接复制用户内存。
+- 内核堆 SLOB 的 arena 页只增不减（上游已知问题，对应 challenge4）。init_main 的“内存已恢复”检查应使用 slob_arena_pages() 把 SLOB 保留页单独扣除，其余物理页仍要求严格相等。
+- kernel_thread_entry 用 s0 作入口、s1 作参数；init_main 正常返回 0，fn 返回后由 entry.S 执行 jal do_exit。
+- do_exit/do_wait 通过 PROC_ZOMBIE、exit_code、WT_CHILD 与父/子/兄弟指针配套；do_wait 负责最后回收僵尸进程的 PCB 与内核栈。
 
-## 必须完成的范围
+[GUARANTEE]
+必须交付：
+static struct proc_struct *alloc_proc(void);
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+static int init_main(void *arg);
+static int user_main(void *arg);
+int kernel_execve(const char *name, const unsigned char *binary, size_t size);
+int do_execve(const char *name, size_t len, unsigned char *binary, size_t size);
+static int load_icode(unsigned char *binary, size_t size);
+int do_wait(int pid, int *code_store);
+static int copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+int dup_mmap(struct mm_struct *to, struct mm_struct *from);
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share);
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
 
-### 模块二：`code/kern/process/proc.c`
+确保各函数在首次引用前已有声明或定义。输出本次完整生成代码、修改位置、实际验证命令及结果，不省略函数体。
 
-1. `alloc_proc`：在 Lab4 基础上初始化 `exit_code`、`wait_state`、`cptr/yptr/optr`；`pgdir` 初始为 `boot_pgdir_pa`。
-2. `kernel_thread`：检查/适配内核线程首次运行现场（`s0/s1`、`SPP=1`、`SPIE=1`、`SIE=0`）。
-3. `init_main`：创建 `user_main` 内核线程，`do_wait` 回收；用真实的进程树、链表、计数、物理页与内核堆断言做收尾检查。
-4. `user_main`：`TEST` 宏存在时 `KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE)`，否则 `KERNEL_EXECVE(exit)`。
-5. `kernel_execve`：构造中断帧并经 `forkrets(tf)` 真正返回用户态；不能只调用 `do_execve`。
-6. `do_execve`：校验参数、复制进程名、替换地址空间、失败时终止进程。
-7. `load_icode`：校验 ELF；建立 VMA、页表和用户栈；加载各段并清零 BSS；设置用户入口、用户栈和 `sstatus`；切换 `satp`；失败时完整清理。
-8. `do_wait`：支持 `pid == 0`（任意子进程）与指定 pid；处理睡眠/唤醒/重查、退出码写回、僵尸进程回收；非法目标返回 `-E_BAD_PROC`。
+[SPECIFICATION]
+1. alloc_proc
+Pre-Condition：无；从 kmalloc 获取一块 struct proc_struct 内存。
+Post-Condition：PCB 所有字段有确定初值，state = PROC_UNINIT、pid = -1、kstack = 0、need_resched = 0、parent/mm/tf = NULL、pgdir = boot_pgdir_pa、flags = 0、name 清零；Lab5 新增的 exit_code、wait_state、cptr/yptr/optr 一并初始化；context 清零。
+Case 1：kmalloc 失败返回 NULL，不持有其他资源。
+Requirements：pgdir 保存启动页表根的物理地址，供 proc_run 拼 satp；不得遗漏 Lab4 已有字段的初始化。
 
-### 模块三
+2. kernel_thread
+Pre-Condition：fn 为内核线程入口，arg 为参数，clone_flags 来自调用者。
+Post-Condition：构造内核态 trapframe，s0 = fn、s1 = arg，status 置 SPP=1、SPIE=1、SIE=0，epc = kernel_thread_entry；以 do_fork(clone_flags | CLONE_VM, 0, &tf) 创建线程，返回新线程 pid 或负错误码。
+Case 1：clone_flags 不含 CLONE_VM 时强制加上，内核线程共享内核地址空间。
+Requirements：trapframe 先清零再填字段；PCB 与内核栈由 do_fork 分配，本函数不自行创建。
 
-1. `copy_mm`（`proc.c`）：区分无用户 mm、`CLONE_VM`、普通复制；维护 `mm_count`、`pgdir`；失败清理。
-2. `dup_mmap`（`kern/mm/vmm.c`）：复制 VMA 区间与属性，调用 `copy_range`。
-3. `copy_range`（`kern/mm/pmm.c`）：逐页分配新物理页并复制，保留权限，维护引用计数与错误路径。
-4. `do_fork`：核对既有实现与用户 fork 路径（PCB、内核栈、mm、中断帧、pid、哈希/链表、唤醒、失败回滚）。
+3. init_main、user_main
+Pre-Condition：init_main 由 kernel_thread 创建，arg 为问候串；user_main 由 init_main 创建。
+Post-Condition：init_main 用 kernel_thread(user_main, NULL, 0) 创建子线程并 do_wait(pid, NULL) 回收；结束时用真实的进程树、链表、计数、物理页与内核堆断言核对全部归还，输出 init check memory pass.；user_main 在 TEST 宏存在时执行 KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE)，否则执行 KERNEL_EXECVE(exit)。
+Case 1：user_main 的 kernel_execve 失败时 panic，不静默返回。
+Case 2：init_main 核对空闲物理页时先用 slob_arena_pages() 扣除 SLOB 保留页，其余物理页要求严格相等。
+Requirements：断言必须是真实检查，不得用打印“通过”文字替代；nr_process、proc_list 以及 initproc->cptr/yptr/optr 的关系须与 do_wait/do_exit 的回收语义一致。
 
-## 现有代码约束（必须遵守）
+4. kernel_execve、do_execve
+Pre-Condition：kernel_execve 的 binary 指向内核镜像中的 ELF，current->tf 非空；do_execve 的名称与映像来自可信内核调用。
+Post-Condition：kernel_execve 清空 current->tf，调用 do_execve(name, strlen(name), binary, size)，成功后在当前线程上下文执行 forkrets(tf)，经 __trapret/RESTORE_ALL/sret 真正返回用户态；do_execve 校验参数、复制进程名并调用 load_icode，加载成功后替换地址空间。
+Case 1：名称长度截断到 PROC_NAME_LEN；旧 mm 的释放放在新 mm 建立并切换 satp 之后，按 mm_count_dec 的结果决定 exit_mmap/put_pgdir/mm_destroy。
+Case 2：load_icode 失败时 do_execve 调用 do_exit(ret)，不返回用户态。
+Requirements：kernel_execve 不能只调用 do_execve，那只替换地址空间、进程仍在内核态；do_execve 必须先建新、再拆旧，避免旧 satp 指向已释放的页表根。
 
-- 只修改标记对应的区域，保留 `//lab5 functionN` 注释，把 `YOUR CODE` 替换为学号 `2412102`。
-- 复用现有结构、头文件和函数签名，不新增并行接口：
-  - `struct proc_struct` / `struct mm_struct` / `struct vma_struct` / `struct trapframe` 保持原样；
-  - `do_execve(const char *name, size_t len, unsigned char *binary, size_t size)`；
-  - `copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)`。
-- `proc->pgdir` 必须保存**页表根的物理地址**（`PADDR(mm->pgdir)`），因为 `proc_run` 直接用它拼 `satp`；`mm->pgdir` 是内核虚拟地址。
-- `RESTORE_ALL` 已由 Lab3 实现：返回用户态时 `SPP=0`，`sscratch` 会设为该中断帧之上的内核栈顶。因此首次进入用户态只要保证 `tf->status`（SPP=0、SPIE=1、SIE=0）、`tf->epc`、`tf->gpr.sp` 正确，并调用 `forkrets(tf)`。
-- 用户程序链接在 `0x800020`，用户栈顶 `USTACKTOP = 0x80000000`，`USTACKPAGE = 256`；栈 VMA 最低页由 `user_mem_check` 作为保护页。
-- `idt_init` 已设置 `sstatus.SUM`，内核可以直接复制用户内存。
-- 内核堆 SLOB 的 arena 页只增不减（上游已知问题，对应 challenge4）。`init_main` 的“内存已恢复”检查应使用 `slob_arena_pages()` 把 SLOB 保留页单独扣除，其余物理页仍要求严格相等。
+5. load_icode
+Pre-Condition：binary/size 是有效 ELF 映像；current->tf 非空。
+Post-Condition：校验 ELF_MAGIC 与 e_phoff/e_phnum 范围；mm_create + setup_pgdir 建立新页表根并复制内核映射；对每个 ELF_PT_LOAD 段校验 p_filesz <= p_memsz、文件偏移不越界、USER_ACCESS 合法，按 p_flags 生成 VMA 标志与含 PTE_U 的 PTE 权限，mm_map 登记 VMA，并从段起始页到结束页逐页 pgdir_alloc_page、整页清零后复制文件内容；建立用户栈 VMA [USTACKTOP-USTACKSIZE, USTACKTOP) 并逐页映射清零；写入 current->mm、current->pgdir，切换 satp 并 sfence.vma；设置 tf->gpr.sp = USTACKTOP、tf->gpr.a0 = 0、tf->epc = e_entry、tf->status 置 SPP=0、SPIE=1、SIE=0。
+Case 1：ELF 非法、段越界、权限非法或分配失败，走 bad_elf，按 VMA 范围 exit_mmap，再释放页表根与 mm。
+Case 2：整页清零发生在复制文件内容之前，保证 p_filesz 之外的 BSS 为 0，testbss 依赖这一点。
+Requirements：切换后内核地址空间仍可见；失败不得留下半成品 mm、页表或映射；用户栈最低一页由 user_mem_check 作为保护页。
 
-## spec 要求
+6. do_wait
+Pre-Condition：pid 来自用户参数，code_store 为 NULL 或用户可写地址。
+Post-Condition：pid == 0 时遍历 proc_list 找任意 parent == current 的僵尸子进程；pid != 0 时 find_proc 后确认 proc->parent == current；找到僵尸后用 copy_to_user 写回 exit_code（NULL 不写），在关中断区完成 unhash_proc + remove_links，再 put_kstack + kfree；有子进程但都未退出时置 PROC_SLEEPING、wait_state = WT_CHILD 并 schedule()，被唤醒后重查，若自身带 PF_EXITING 则 do_exit(-E_KILLED)；没有子进程返回 -E_BAD_PROC。
+Case 1：code_store 非空但不可写，返回 -E_INVAL，不直接解引用该地址。
+Case 2：目标是 idleproc/initproc 或不是自己的子进程，返回 -E_BAD_PROC。
+Requirements：回收顺序是先摘哈希与链表、再释放内核栈与 PCB；退出码写回、PROC_ZOMBIE 与 WT_CHILD 的语义必须与 do_exit 严格配套。
 
-对每个函数说明并实现：
+7. copy_mm、dup_mmap、copy_range
+Pre-Condition：copy_mm 的 proc 是新 PCB；普通 fork 时 current->mm 有效。
+Post-Condition：current->mm == NULL 时子进程 mm = NULL 并返回 0；CLONE_VM 时 mm_count_inc 并共享 mm 与 pgdir；普通复制时 mm_create、setup_pgdir 复制内核映射、dup_mmap 复制全部 VMA，成功后 set_mm_count(mm, 1)，proc->pgdir = PADDR(mm->pgdir)。dup_mmap 逐个 VMA 用 vma_create 复制区间与属性，insert_vma_struct 登记后调用 copy_range。copy_range 只处理 4 KiB 有效用户叶映射，get_pte(from, start, 0) 只查询、get_pte(to, start, 1) 按需建表，目标地址不得已映射，保留源 PTE 权限，alloc_page + memcpy 后 page_insert。
+Case 1：dup_mmap/copy_range 失败返回 -E_NO_MEM 或 -E_INVAL，copy_mm 走 bad_mm：exit_mmap 撤销已复制映射，再 put_pgdir、mm_destroy。
+Case 2：没有二级页表的 2 MiB 区间直接跳过。
+Requirements：share 参数在本基线固定传 false，COW 由后续任务扩展；proc->pgdir 存物理地址、mm->pgdir 存内核虚拟地址；失败时不得留下半成品地址空间。
 
-1. 输入/输出与返回值；
-2. 前置条件与状态约束；
-3. 边界条件（`pid` 范围、`code_store == NULL`、ELF 越界、空段、BSS、页对齐、地址范围）；
-4. 失败清理（已分配的物理页、页表、mm、内核栈、PCB）；
-5. 与其他模块的衔接（`do_exit` 的 `exit_code/PROC_ZOMBIE/WT_CHILD`；`RESTORE_ALL` 的中断帧布局；`do_fork` 的 `copy_thread`）。
+8. do_fork
+Pre-Condition：do_fork 由 Lab4 提供，本模块只需核对其与用户 fork 路径的衔接；clone_flags、stack、tf 来自 kernel_thread 或 sys_fork。
+Post-Condition：nr_process >= MAX_PROCESS 返回 -E_NO_FREE_PROC；alloc_proc 后置 parent，依次 setup_kstack、copy_mm、copy_thread；在关中断区完成 get_pid、hash_proc、set_links；wakeup_proc 后返回 proc->pid。
+Case 1：setup_kstack 失败回滚 PCB。
+Case 2：copy_mm 失败回滚内核栈；mm 由 copy_mm 自行清理。
+Requirements：PID 分配、哈希、链表与计数在同一关中断区内完成，不能让调度器看到半个进程；失败按相反顺序回滚；不修改 Lab4 既有的结构性约定。
 
-## 输出要求
+9. 验证
+- 使用实验配套 GCC 10.1.0 工具链编译，并用 QEMU 4.1.1 运行：设置 `PATH=/opt/riscv/riscv64-unknown-elf-gcc-10.1.0-2020.08.2-x86_64-linux-ubuntu14/bin:$PATH`、`QEMU=$HOME/qemu-src/qemu-4.1.1-inst/bin/qemu-system-riscv64`，依次执行 `make`、`make qemu`（默认运行 exit）、`make grade`（13 个用户程序）。
+- 重点观察 `hello`、`yield`、`badarg`、`exit`、`spin`、`forktest` 的输出，尤其是 `exit pass.`、`all user-mode processes have quit.`、`init check memory pass.`。
+- 若 `forktest` 报空闲页不相等，先确认是否只有 SLOB arena 页未归还（用 `slob_arena_pages()` 扣除后再比较），而不是用户映射/页表/内核栈的真实泄漏。
 
-- 给出可直接编译的完整函数实现，不要伪代码；
-- 每个函数附简短中文注释，解释关键状态、页表或寄存器处理；
-- 在每个函数末尾说明失败路径会释放哪些资源；
-- 不要修改不属于本模块的函数。
-
----
-
-## 验证提示词（追加）
-
-> 请用实验配套 GCC 10.1.0 工具链编译，并用 QEMU 4.1.1 运行：
->
-> ```bash
-> export PATH=/opt/riscv/riscv64-unknown-elf-gcc-10.1.0-2020.08.2-x86_64-linux-ubuntu14/bin:$PATH
-> export QEMU=$HOME/qemu-src/qemu-4.1.1-inst/bin/qemu-system-riscv64
-> make
-> make qemu        # 默认运行 exit
-> make grade       # 13 个用户程序
-> ```
->
-> 重点观察 `hello`、`yield`、`badarg`、`exit`、`spin`、`forktest` 的输出，尤其是 `exit pass.`、`all user-mode processes have quit.`、`init check memory pass.`。
-> 若 `forktest` 报空闲页不相等，请先确认是否只有 SLOB arena 页未归还（用 `slob_arena_pages()` 扣除后再比较），而不是用户映射/页表/内核栈的真实泄漏。
+````
 
 ### 功能模块四：进程退出、让出 CPU 与终止
 
