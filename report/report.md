@@ -747,8 +747,6 @@ int do_kill(int pid);          // 向目标进程发送退出意图：设置 PF_
 对齐点；最后给出可编译、可在 QEMU 中验证的结论。
 ```
 
-> 本模块的完整版提示词（含“现有代码约束”“必须完成的范围”“逐函数 spec”“验证提示词”），以及双重 GDB 任务的独立提示词，见 [prompt-A.md](prompt-A.md)。
-
 #### 4.4.4 实现迭代过程
 
 本模块实现了 4 轮，前 3 轮都暴露了真实问题。
@@ -974,7 +972,7 @@ int do_kill(int pid)
 
 #### 4.4.6 已核对内容与验证结论
 
-**（1）注入版评分测试**（`tools/inject.py` 把 `test_lab5.c` 注入临时副本后编译运行）：
+**（1）注入版评分测试**：
 
 ```text
 [Test Process Create] PASS
@@ -1603,7 +1601,6 @@ make clean && make        # 回到默认 exit 构建，避免把 TEST=hello 留�
 5. **把“抓马细节”当成学习材料**。`priv=1` 的 SBI ecall、`env->sstatus` 不存在、`ptrace_scope=1`，这些都不是“实验失败”，而是理解模拟器和 Linux 安全机制的好机会；写进报告比只贴一张成功截图更有价值。
 6. **AI 不能替代“跑一遍”**。代码能编译不等于语义正确；`[Test Process Control] PASS`、13 个用户程序、`init check memory pass.` 这些真实输出，才是交付的依据。最终报告里的结论都应该能指回一条命令或一段日志。
 
----
 
 ---
 
