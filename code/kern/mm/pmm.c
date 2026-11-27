@@ -391,63 +391,134 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 
 
 //lab5 function3 2412102
-// copy_range - 把 from 页表中 [start, end) 的有效用户映射逐页复制到 to。
-// 普通 fork 采用 eager copy：每页分配新物理页并复制内容，父子相互独立。
-// share=true 预留给 COW 扩展；本基线始终执行真实复制。
-int
-copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+// COW Challenge 2411033
+// share=false：分配新数据页，执行普通复制。
+// share=true：共享物理页，对原本可写的页面设置 COW。
+int copy_range(pde_t *to, pde_t *from,
+               uintptr_t start, uintptr_t end, bool share)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
 
-    (void)share; // 普通 fork 基线不使用共享路径
+    if (to == NULL || from == NULL || to == from) {
+        return -E_INVAL;
+    }
 
-    while (start < end)
-    {
-        pte_t *ptep = get_pte(from, start, 0);
-        if (ptep == NULL)
-        {
-            // 该 2 MiB 区间没有页表，直接跳过。
+    while (start < end) {
+        // 当前实验使用单 hart，保护映射与引用计数的更新。
+        bool intr_flag;
+        local_intr_save(intr_flag);
+        int ret = 0;
+
+        pte_t *src = get_pte(from, start, 0);
+
+        if (src == NULL) {
+            // 缺少末级页表，跳过对应的 2 MiB 区间。
+            local_intr_restore(intr_flag);
             start = ROUNDDOWN(start + PTSIZE, PTSIZE);
             continue;
         }
 
-        if (*ptep & PTE_V)
-        {
-            pte_t *nptep = get_pte(to, start, 1);
-            if (nptep == NULL)
-            {
-                return -E_NO_MEM;
-            }
-            if (*nptep != 0)
-            {
-                // 目标地址已被映射，说明调用参数不一致。
-                return -E_INVAL;
+        if (!(*src & PTE_V)) {
+            // 当前页没有有效映射。
+            local_intr_restore(intr_flag);
+            start += PGSIZE;
+            continue;
+        }
+
+        uint32_t perm = (uint32_t)(*src & 0x3FF);
+
+        // 本接口处理 4 KiB 用户叶子映射。
+        // RISC-V 的可写页同时需要具有读权限。
+        if (!(perm & PTE_U) ||
+            !(perm & (PTE_R | PTE_X)) ||
+            ((perm & PTE_W) && !(perm & PTE_R))) {
+            ret = -E_INVAL;
+            goto page_out;
+        }
+
+        pte_t *dst = get_pte(to, start, 1);
+        if (dst == NULL) {
+            ret = -E_NO_MEM;
+            goto page_out;
+        }
+
+        if (*dst != 0) {
+            // 目标区间应为空，保留已有目标映射。
+            ret = -E_INVAL;
+            goto page_out;
+        }
+
+        struct Page *page = pte2page(*src);
+
+        if (share) {
+            /*
+             * COW 路径：
+             * 原本可写的页面清除写权限并设置 COW。
+             * 已经带有 COW 标记的页面继续保持共享。
+             * 真正只读的页面保留只读权限和原有标记。
+             */
+            if (perm & (PTE_W | PTE_COW)) {
+                perm = (perm & ~PTE_W) | PTE_COW;
             }
 
-            // 沿用源页的权限位（R/W/X/U/A/D）。
-            uint32_t perm = (uint32_t)(*ptep & 0x3FF);
-            struct Page *page = pte2page(*ptep);
+            /*
+             * 先建立子映射。
+             * page_insert() 增加一次数据页引用计数。
+             */
+            ret = page_insert(to, page, start, perm);
 
-            struct Page *npage = alloc_page();
-            if (npage == NULL)
-            {
-                return -E_NO_MEM;
-            }
-            memcpy(page2kva(npage), page2kva(page), PGSIZE);
+            if (ret == 0 &&
+                *src != pte_create(page2ppn(page), perm)) {
+                // 子映射成功后，更新父映射权限。
+                *src = pte_create(page2ppn(page), perm);
 
-            // page_insert 负责把新页映射到子页表并增加引用计数。
-            if (page_insert(to, npage, start, perm) != 0)
-            {
-                free_page(npage);
-                return -E_NO_MEM;
+                // 清除父进程可能缓存的旧写权限。
+                tlb_invalidate(from, start);
             }
         }
+        else {
+            /*
+             * 普通复制路径：
+             * 新副本由子进程独占。
+             * 若源页属于 COW，新副本恢复原有写权限。
+             */
+            if (perm & PTE_COW) {
+                perm = (perm | PTE_W) & ~PTE_COW;
+            }
+
+            struct Page *new_page = alloc_page();
+            if (new_page == NULL) {
+                ret = -E_NO_MEM;
+                goto page_out;
+            }
+
+            memcpy(page2kva(new_page),
+                   page2kva(page), PGSIZE);
+
+            ret = page_insert(to, new_page, start, perm);
+            if (ret != 0) {
+                free_page(new_page);
+            }
+        }
+
+page_out:
+        local_intr_restore(intr_flag);
+
+        if (ret != 0) {
+            /*
+             * 调用方负责清理已经构建的子地址空间。
+             * 父进程剩余的 COW 映射继续有效；
+             * 引用降为 1 后，可通过写异常恢复权限。
+             */
+            return ret;
+        }
+
         start += PGSIZE;
     }
+
     return 0;
 }
-
 
 //lab4 请补充你在lab4中的代码
 

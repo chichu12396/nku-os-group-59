@@ -288,11 +288,11 @@ dup_mmap(struct mm_struct *to, struct mm_struct *from)
             }
             insert_vma_struct(to, nvma);
 
-            // 普通 fork 使用 eager copy，父子可写数据相互独立。
-            // COW Challenge 在此处改传 share=true，共享物理页。
-            bool share = 0;
+           // 根据模式开关选择普通复制或 COW 共享。
+            bool share = LAB5_USE_COW;
             int ret = copy_range(to->pgdir, from->pgdir,
-                                 vma->vm_start, vma->vm_end, share);
+                                vma->vm_start, vma->vm_end, share);
+
             if (ret != 0)
             {
                 local_intr_restore(intr_flag);

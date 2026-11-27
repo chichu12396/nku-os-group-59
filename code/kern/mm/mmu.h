@@ -80,6 +80,7 @@
 #define PTE_D 0x080    // Dirty
 #define PTE_SOFT 0x300 // Reserved for Software
 #define PTE_COW 0x100  // RSW bit 8: originally writable, temporarily read-only
+#define LAB5_USE_COW 1 // 新增：0 为普通复制，1 为 COW
 
 #define PAGE_TABLE_DIR (PTE_V)
 #define READ_ONLY (PTE_R | PTE_V)
