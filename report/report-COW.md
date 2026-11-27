@@ -2,7 +2,6 @@
 
 **负责人：** 2411033-季艾佳  
 **实现范围：** COW 页面标记、fork 页共享接口、写异常处理、内核写入用户内存、引用计数与资源回收。  
-**测试材料：** 本报告预留测试结果、实验现象和结论栏，供后续验收填写。
 
 ## 一、设计目标与实现主线
 
@@ -50,6 +49,8 @@ COW 利用这一层间接关系：fork 初期，父子进程在地址 V 处指�
 ```c
 #define PTE_COW 0x100
 ```
+
+本次测试将 `LAB5_USE_COW` 设为 1。`dup_mmap()` 通过 `bool share = LAB5_USE_COW` 选择共享分支，使实际用户 fork 进入 COW 路径。
 
 对于原本可写的用户页，fork 的共享路径清除 `PTE_W`，并设置 `PTE_COW`。处理器根据 `PTE_W` 触发写页异常；内核根据 `PTE_COW` 识别原有的写权限。
 
@@ -308,32 +309,9 @@ exit_range(pgdir, USERBASE, USERTOP);
 
 ### 5.2 映射状态图
 
-```mermaid
-stateDiagram-v2
-    state "U：映射缺失或已解除" as U
-    state "P：私有可写，r=1" as P
-    state "CS：COW 共享，r≥2" as CS
-    state "C1：COW 单引用，r=1" as C1
-    state "RO：真正只读" as RO
+![COW 映射状态转换图](./images/COW_映射状态转换图.png)
 
-    [*] --> U
-    U --> P: 装载可写用户页
-    U --> RO: 装载只读用户页
-    P --> P: 用户写入
-    P --> CS: COW fork，新增子映射
-    CS --> CS: 再次 fork，r 增加 1
-    C1 --> CS: 再次 fork，r 从 1 增至 2
-    CS --> P: 当前映射写入，新页 r=1
-    CS --> C1: 其他映射离开旧页，旧页 r 降至 1
-    C1 --> P: 当前映射写入，恢复原页权限
-    RO --> RO: fork，共享只读页
-    RO --> RO: 写权限检查失败，等待外层错误处理
-    CS --> CS: 分配失败，保持原映射
-    P --> U: 解除当前映射
-    CS --> U: 解除当前映射
-    C1 --> U: 解除当前映射
-    RO --> U: 解除当前映射
-```
+图中以蓝色表示 fork 新增共享，以绿色表示当前映射写入，以橙色表示其他映射离开旧页。底部集中绘制四种有效状态解除映射后进入 U 的转换；上方与下方的 U 表示同一状态。
 
 图中从 CS 到 P 的箭头描述写入方取得新页。从 CS 到 C1 的箭头描述旧页的剩余持有者。两条箭头可以由同一次复制事件引起，分别对应不同进程的观察视角。
 
@@ -386,627 +364,196 @@ stateDiagram-v2
 
 本例中，子进程的写入引入一次整页复制，父进程后续写入采用单引用恢复。状态表同时描述权限变化、物理页归属与回收时机。
 
-## 六、测试设计与观察指标
+## 六、COW 专项测试与基础回归验证
 
-### 6.1 分层验证安排
+### 6.1 测试目标与执行方式
 
-本次实验将验证分为目标文件编译、主机隔离检查和 QEMU 用户态测试三层。三层分别观察类型与接口、内存管理状态变化、实际进程与处理器行为。
+本次实验在 `LAB5_USE_COW=1` 的配置下完成两项验证：先运行 COW 专项用户程序，再运行 Lab5 基础评分。**专项测试观察共享、写入和回收过程中的页面变化；基础评分检查 COW 与原有进程管理功能的配合。**
 
-现有 [test_cow_host.py](../code/tools/test_cow_host.py) 提供主机隔离检查。脚本读取项目中的函数定义和头文件，组合成临时 C 程序，交由宿主 GCC 编译，并启用 UndefinedBehaviorSanitizer 检查运行期间的未定义行为。脚本为分配器、CSR 和 TLB 操作提供模拟实现。
-
-**隔离用例记录 PTE、物理页内容、引用计数和资源回收；QEMU 用例记录真实 fork、异常返回与进程生命周期。** 两组材料分别填写对应的结果栏。
-
-### 6.2 测试装置与指标含义
-
-脚本准备四个测试地址空间。`setup()` 分配根页表并登记用户 VMA，`map()` 建立测试数据映射，`entry()` 读取 PTE。`destroy()` 调用实际 `exit_mmap()` 后释放测试根页表，`finish()` 核对剩余空闲页数与中断状态。
-
-模拟分配器提供 128 个物理页，每页 4096 字节。测试将新建数据页填充为 0x5A，并在写入时使用 0xA5 或 0x37，便于区分原值与修改值。`budget` 指定后续允许的成功分配次数，用于构造确定的内存不足位置。
-
-| 指标 | 测量对象 | 记录方式与解释 |
-|---|---|---|
-| PTE 中的物理页号 | 父子当前访问的数据页 | 相同页号表示共享；写入方换用新页号表示完成分离 |
-| `PTE_W` 与 `PTE_COW` | 当前映射的写入状态 | `0/1` 对应 COW，只读页采用 `0/0`，私有可写页采用 `1/0` |
-| `page_ref()` | 同一数据页的映射引用数 | 与新增、替换和解除映射的次数对应 |
-| `allocations` 的前后差值 | 测试期间成功的页面分配次数 | 统计包含页表页；测试单引用恢复时先准备页表，再比较差值 |
-| 字节比较与 `memcmp()` | 物理页内容和目标区间边界 | 核对初始复制、父子隔离与跨页写入长度 |
-| `nr_free_pages()` | 模拟分配器的空闲页数量 | 完整清理后与 128 页初始容量比较，检查资源归还 |
-| `tlbs`、`full_fences` | 模拟刷新接口调用 | 记录刷新分支的调用，真实地址翻译行为在 QEMU 中观察 |
-| `test_sstatus` | 进入与退出临界区的中断状态 | 核对开启状态和关闭状态下的保存、恢复行为 |
-| `checks` | 测试断言累计次数 | 含测试装置、资源清理与功能断言，作为覆盖执行记录 |
-
-### 6.3 H01：fork 共享、只读属性与地址空洞
-
-**设计步骤。** 本次实验建立一个可写用户页、一个只读可执行页，以及一个地址空洞，再调用 `copy_range(..., true)` 复制这段区间。
-
-**验收标准。** 父子可写页指向同一物理页，双方 PTE 满足 `W=0、COW=1`，数据页引用增至 2。只读页引用增至 2，双方保留 `W=0、COW=0` 和执行属性。地址空洞继续保持缺少映射的状态。
-
-**原因分析。** 本例同时区分物理页共享与写权限恢复资格。共享关系通过页号和引用数体现，原有写权限通过 COW 标记体现。空洞检查进一步约束复制范围，避免将用户地址窗口中的空白区域扩展成有效页面。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.4 H02：写异常复制与单引用恢复
-
-**设计步骤。** 父子共享一个填充为 0x5A 的可写页。测试构造用户写页异常中断帧，将 `tval` 设为页内地址，记录 `epc` 与 `a0`，调用实际 `exception_handler()`。随后修改子页字节，再调用父页的 COW 处理。
-
-**验收标准。** 子页换用新物理页，复制后的初始内容与旧页一致，父页字节维持 0x5A。异常处理后 `epc` 和 `a0` 保持原值。父页成为单引用后恢复写权限，其物理页号与分配次数保持原值。
-
-**原因分析。** 子页的页号变化证明内核为写入方创建了数据副本；父页内容检查约束共享隔离。`epc` 检查对应原写指令的重试语义，`a0` 检查对应普通异常处理对寄存器现场的保持。父页的零分配差值则对应单引用恢复分支。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.5 H03：多次 fork 的引用关系
-
-**设计步骤。** 测试从第一个地址空间共享到第二个，再从第二个共享到第三个。随后依次处理第二、第一、第三个地址空间的写入。
-
-**验收标准。** 三份映射初始共享同一页，引用数为 3。前两次写入分别创建私有页，旧页引用按 3→2→1 变化。最后一个持有者通过权限恢复继续使用旧页，并保留原执行属性。
-
-**原因分析。** 已带有 COW 标记的页面继续 fork 时，源 PTE 的 `PTE_W` 已经清除。`copy_range()` 同时检查 `PTE_W|PTE_COW`，使这种源页继续进入共享路径。多次写入与引用递减构成对该分支的连续检查。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.6 H04：普通复制与 COW 复制的衔接
-
-**设计步骤。** 测试先通过 `share=false` 复制可写页，再建立 COW 共享映射，并从该 COW 页执行一次普通复制。
-
-**验收标准。** 普通复制得到独立的物理页，子页满足 `W=1、COW=0`。从 COW 页复制得到的新页也具备这一权限组合，源页继续保留共享关系与原引用数。
-
-**原因分析。** 普通复制已经提供独立的数据副本，因此子页可以恢复原有写权限。这个用例约束两种复制方式之间的转换，使普通基线与 COW 扩展复用同一接口。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.7 H05：分配失败与区间中途失败
-
-**设计步骤。** 本次实验通过 `budget=0` 构造子页表分配失败和 COW 新数据页分配失败。另一组用例在相邻的两个 2 MiB 区间各放置一个数据页，并通过分配预算使子地址空间在建立第二个末级页表时失败。
-
-**验收标准。** 初次建立子映射前失败时，父 PTE 与引用数保持原值。COW 新页分配失败时，原共享 PTE 与数据内容保持原值。区间中途失败时，首个数据页已经形成 COW 共享关系，第二个数据页保留可写原映射；清理子映射后，首个父页进入单引用恢复路径。
-
-**原因分析。** 内核按页推进复制，因此失败点之前和之后具有不同的资源状态。跨 2 MiB 边界可以使第二次页表分配发生在一个确定的位置。验收分别核对已建立共享页、尚待处理页面和部分页表的清理责任。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.8 H06：权限、地址与目标映射检查
-
-**设计步骤。** 测试分别传入真正只读页、只读 VMA、栈保护页、缺少用户权限的 PTE、地址空洞、零地址、发生回绕的地址、空地址空间，以及已经存在映射的复制目标区间。
-
-**验收标准。** COW 处理对访问条件冲突返回 `-E_INVAL`，保留原有页内容和权限。`copy_range()` 对已占用目标保留原映射；对合法范围中的空洞按地址区间继续推进。
-
-**原因分析。** VMA、PTE、地址范围和目标占用分别约束不同层次。将它们拆成独立输入，可以定位错误属于区域权限、硬件映射还是复制接口使用方式。后续 QEMU 用例再记录用户权限错误对应的进程退出行为。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.9 H07：内核跨页写入与目标地址空间选择
-
-**设计步骤。** 父子共享两个相邻页。测试让当前进程关联父地址空间，通过 `copy_to_user()` 向子地址空间第一页末尾 4 字节处写入 12 字节的 0x37 数据。
-
-**验收标准。** 子地址空间的两个目标页分别取得私有副本。第一页最后 4 字节、第二页最前 8 字节按输入变化，邻接字节保持 0x5A。父页内容保持原值，目标 PTE 具有访问与修改属性。
-
-**原因分析。** 两页写入检查了每页的 COW 准备与复制长度。当前地址空间与目标地址空间的区分则约束 `copy_to_user()` 的寻址方式：内核必须通过目标 `mm` 找到物理页，再利用线性映射完成写入。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.10 H08：跨页写入准备阶段的失败
-
-**设计步骤。** 测试沿用两页共享布局，将分配预算设为 1，使第一页 COW 准备成功、第二页 COW 准备失败，再调用跨页的 `copy_to_user()`。
-
-**验收标准。** 函数返回失败。第一页可以保留新私有页，第二页继续指向共享旧页，两页目标数据都维持原值。后续完整清理归还测试所分配的页面。
-
-**原因分析。** 第一阶段只调整映射，第二阶段才复制用户数据，因此准备失败的位置先于第一次数据写入。该设计将写入完整性与映射回滚分开处理，既保留数据内容，也保持引用计数与实际映射一致。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.11 H09：局部回收与兄弟页表保护
-
-**设计步骤。** 测试在 V 和 V+2 MiB 处各建立一页，使两页位于同一中间页表的不同末级页表中。随后解除并清理 V 所在区域，再检查另一页；最后清理第二个区域。
-
-**验收标准。** 第一次清理释放首个空末级页表，保留仍有有效子项的中间页表与第二个数据页。第二次清理后，内核回收剩余的空末级页表和中间页表。
-
-**原因分析。** 这个布局将局部区间清理与整张上级页表的生命周期分离。通过比较第一次清理前后的中间表项与第二页映射，可以检查 `page_table_empty(pd0)` 是否覆盖全部兄弟表项。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.12 H10：部分构建的地址空间清理
-
-**设计步骤。** 一组用例只成功分配中间页表，随后让末级页表分配失败；另一组先建立数据映射，再将测试 VMA 链表置为空。两组均调用实际的 `exit_mmap()`。
-
-**验收标准。** 内核回收用户范围内的残留映射和空页表。清理完成后，测试根页表中的用户项归零，预设的内核表项保持原值，最终空闲页数恢复到初始容量。
-
-**原因分析。** fork 和 exec 的分配过程具有多个中间状态，页表或映射的建立可能早于对应 VMA 的最终登记。完整用户窗口扫描直接依据现有页表回收资源，使清理覆盖这些构建阶段。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.13 H11：父子清理顺序与中断状态
-
-**设计步骤。** 本次实验分别安排子地址空间先清理和父地址空间先清理，再让剩余持有者写入页面。测试还分别从中断开启、关闭状态进入回收和复制函数。
-
-**验收标准。** 首个地址空间清理后，数据页引用降至 1，剩余映射继续有效。最后一个持有者写入时采用单引用恢复；完整清理后，空闲页数恢复初值。函数退出时的中断状态与进入时相同。
-
-**原因分析。** COW 的页面生命周期取决于剩余引用，进程的父子身份与退出顺序只决定引用减少的先后。中断状态检查约束嵌套临界区，确保内层函数沿用外层状态。
-
-**测试结果：**
-
-**实验现象：**
-
-**结论：**
-
-### 6.14 QEMU 用户态用例设计
-
-本次实验在 A、B 的进程路径接齐后，将下列用例加入用户程序测试。现有主机隔离脚本中的多个 `mm_struct` 对应内存管理测试对象；下表通过实际进程、用户写指令和系统调用观察同样的状态转换。
-
-| 编号 | 用例设计 | 核对内容 | 原因与判定依据 |
-|---|---|---|---|
-| Q01 | 子进程写全局变量，父进程等待后读取原值 | 子值变化，父值保持初值 | 写入方取得私有数据页，父映射继续持有旧页 |
-| Q02 | 父进程写全局变量，子进程让出 CPU 后读取原值 | 父值变化，子值保持初值 | 父映射在 fork 时同样进入 COW 只读状态 |
-| Q03 | 父子先后向同页写入不同值 | 双方各自读回目标值 | 首次写入分离映射，剩余单引用映射恢复权限 |
-| Q04 | 一个进程多次 fork，再分别修改数据 | 各进程读回各自数据 | 已带 COW 标记的页面继续共享并维护引用 |
-| Q05 | 父进程通过 `waitpid()` 接收退出码，存储变量位于 COW 页 | 退出码正确，其他进程的对应数据保持原值 | `do_wait()` 经 `copy_to_user()` 准备并写入目标页 |
-| Q06 | 用户写入真正只读程序页，父进程继续运行并回收子进程 | 权限错误对应子进程终止，父进程继续执行 | 页表与 VMA 的权限检查控制写入资格 |
-| Q07 | 在两页对齐缓冲区中逐字节写入，跨越页边界 | 两页数据与边界相邻字节符合输入 | 通过对齐的字节访问观察两页 COW，区分写页异常与访存对齐条件 |
-| Q08 | 交替安排父先退出、子先退出与子进程 exec | 剩余进程数据有效，旧地址空间资源完成回收 | COW 引用随实际映射解除，exec 结束旧映射生命周期 |
-| Q09 | 循环创建并等待子进程，记录前后空闲页数 | 用户数据页、用户页表和进程资源归还 | 多轮运行累积检查引用与生命周期配合 |
-| Q10 | COW 扩展后运行基础评分 | 基础用户程序评分及公共检查 | 将扩展路径与加载、调度、系统调用及回收共同验收 |
-
-### 6.15 运行命令与结果记录
-
-在 `lab5/code` 目录下，目标文件编译与隔离检查采用：
+两项测试采用以下命令，在 `lab5/code` 目录执行：
 
 ```bash
-make obj/kern/mm/pmm.o obj/kern/mm/vmm.o obj/kern/trap/trap.o 'DEFS+=-Werror'
-python3 tools/test_cow_host.py
-```
-
-整机集成阶段采用：
-
-```bash
-make qemu
+python3 tools/run_cow_test.py
 make grade
 ```
 
-用户态专项用例随对应程序加入构建后，采用项目的 `build-<程序名>` 目标及适用的运行入口执行。
+专项测试由两个文件配合完成。[cowtest.c](../code/user/cowtest.c) 在 ucore 用户态执行 fork、写内存、wait 和 kill，并通过断言检查数据与退出码。[run_cow_test.py](../code/tools/run_cow_test.py) 检查 COW 开关，在临时副本中构建 `cowtest`，启动 QEMU，再核对用户断言、页表快照和最终回收检查。
 
-| 记录项 | 实际记录 |
-|---|---|
-| 测试日期与代码版本 | |
-| 目标文件编译结果 | |
-| 隔离检查输出与断言数量 | |
-| Q01～Q10 运行结果 | |
-| 基础评分结果 | |
-| 关键 PTE、引用计数与空闲页记录 | |
-| 日志与截图路径 | |
-| 实验现象及原因分析 | |
-| 最终验收结论 | |
+内核通过原有 `print_pgdir()` 系统调用输出页表信息。脚本从中提取探针页的物理地址及 `PTE_W`、`PTE_COW`，将核对结果汇总为终端中的 `PASS`。因此，专项测试既检查程序读回的数据，也检查数据隔离对应的页表变化。
 
-## 七、进程模块的集成约定
+### 6.2 专项测试结果与观察指标
 
-本次实验当前将 COW 实现集中在内存管理与写异常入口。接入进程生命周期时，各路径沿用以下约定。
+本次运行完成七组用户态检查，脚本还给出页表证据与最终回收两项检查结果。图 1 汇总了这九项结果。
 
-| 集成位置 | 接入方式 | 对应资源语义 |
+![图 1 COW 专项测试结果](./images/C-cowtest.png)
+
+**图 1：七组用户态测试、页表状态检查和最终进程及内存回收检查均为 PASS。**
+
+| 输出项目 | 实际检查内容 | 对应的 COW 设计要求 |
 |---|---|---|
-| `copy_mm()` 普通用户 fork | 创建独立 `mm` 与用户页表，交由 `dup_mmap()` 复制区域 | 父子分别持有地址空间管理结构 |
-| `dup_mmap()` | 完成 VMA 复制后调用 `copy_range(..., true)` | 用户数据页按 COW 方式共享 |
-| `copy_mm()` 的 `CLONE_VM` 分支 | 共享整个 `mm`，维护 `mm_count` | 地址空间生命周期按使用者数量管理 |
-| `do_wait()` 退出码写回 | 从内核临时变量通过 `copy_to_user()` 写入目标用户地址 | 内核写入沿用用户页的 COW 规则 |
-| `do_exit()`、`do_execve()` | 在旧 `mm` 使用者归零后清理旧映射，再释放根页表与管理结构 | 页面引用结束后再归还物理页 |
-| fork、exec 的失败分支 | 对部分构建的 `mm` 调用对应清理接口 | 已分配页表与已插入映射都有清理归属 |
+| `mapping-and-writes` | 子进程写入后保留各自数据，父进程随后完成写入 | 写入方取得私有数据，剩余持有者恢复写权限 |
+| `parent-writes` | 父进程修改数据，子进程继续读回初值 | 父映射和子映射同样遵守写时复制 |
+| `multiple-forks` | 多个子进程及孙进程修改各自数据 | 继续 fork 时保留 COW 共享语义 |
+| `cross-page` | 在页边界两侧写入，并检查相邻字节 | 对两个目标页分别完成 COW 处理 |
+| `wait-copyout` | 内核写回退出码，观察进程继续读回原值 | 内核写用户空间时维护 COW 隔离 |
+| `readonly` | 子进程尝试修改真正只读页，父进程取得对应退出码 | COW 权限恢复保留原有的访问权限约束 |
+| `repeated-exit` | 连续进行 16 轮 fork、写入与等待 | 多轮复制及退出过程维护有效的页面引用 |
+| `PTE evidence` | 比较四次快照的物理页号和权限位 | 建立共享、写后分离和单引用恢复的页表证据 |
+| `Final cleanup` | 核对进程树、内核堆和物理页收尾断言 | 用户进程结束后归还对应资源 |
 
-`do_wait()` 应在退出码写回成功后完成对应的回收提交。这样，写回准备期间的分配失败仍可由调用方接收错误并处理等待关系。
+本次测试使用的指标与含义如下：
 
-本次工作区的普通用户地址空间复制、退出和程序替换路径仍处于集成阶段。本报告按现有 COW 函数说明设计与接口，实际进程结果填写在测试记录中。完整 Challenge 材料还包括 Dirty COW 资料研究、模拟条件评估、适用场景的错误与修复对照，以及对应证据；这些内容在专项工作完成后补充。
+| 指标 | 观察方式 | 判定依据 |
+|---|---|---|
+| **物理页起始地址 PA** | 比较同一虚拟页在不同快照中的映射 | 原页号相同对应共享或原页复用，写入方取得新页号对应分离 |
+| **写权限与 COW 标记** | 对 PTE 分别按 `0x004`、`0x100` 取位 | `W=0、COW=1` 为延迟写入状态；`W=1、COW=0` 为私有可写状态 |
+| **字节与整数值** | 用户程序执行读取断言 | 按测试输入核对修改值、原值与边界字节 |
+| **退出码** | 父进程通过 `waitpid()` 接收 | 核对正常退出、内核写回及权限错误处理 |
+| **资源收尾状态** | 内核执行 `init_main()` 中的断言 | 核对进程关系、堆分配及物理页归还情况 |
+| **基础评分** | 执行 `make grade` | 核对 13 个基础用户程序的功能与公共检查 |
 
-## 附录：当前实现代码
+### 6.3 子进程写入、父进程恢复与页表证据
 
-以下代码按本次工作区提取。正文说明各阶段的操作顺序与原因，附录保存对应函数的完整实现，便于对照代码复核。
+**测试目的。** COW 的关键在于 fork 阶段共享数据页，在写入阶段建立私有数据。父子各自读回正确值还需要配合物理页号与权限位，才能完整描述这一过程。本次实验选择一个独占 4 KiB 且按页对齐的 `probe` 数组，避免其他全局变量的写入提前改变探针页状态。
 
-### A.1 标记与接口声明
+**测试过程。** 父进程先将 `probe[7]` 设为 `0x5A`，再执行 fork。子进程记录 `child-before` 快照，将该字节改为 `0xA5`，记录 `child-after` 快照后以 `0x11` 退出。父进程通过 `waitpid()` 核对退出码，再确认自身读回值仍为 `0x5A`。随后，父进程记录 `parent-before` 快照，将该字节改为 `0xB2`，最后记录 `parent-after` 快照。
 
-```c
-#define PTE_COW 0x100
+**测试结果与实验现象。** 图 1 中 `mapping-and-writes` 与 `PTE evidence` 均为 `PASS`。本次运行的探针虚拟地址为 `0x805000`，四次快照的关键数据如下。表中的字节值对应用户程序通过的读取断言。
 
-int do_cow_fault(struct mm_struct *mm, uintptr_t addr);
-int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share);
-bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len);
-```
+| 快照 | 记录时机 | 物理页起始地址 PA | `PTE_W` | `PTE_COW` | `probe[7]` |
+|---|---|---|---|---|---|
+| `child-before` | 子进程首次写入前 | `0x804CA000` | 0 | 1 | `0x5A` |
+| `child-after` | 子进程写入后 | `0x805D6000` | 1 | 0 | `0xA5` |
+| `parent-before` | 父进程等待子进程退出后，自身首次写入前 | `0x804CA000` | 0 | 1 | `0x5A` |
+| `parent-after` | 父进程写入后 | `0x804CA000` | 1 | 0 | `0xB2` |
 
-### A.2 copy_range：共享与普通复制
+**原因分析。** 子进程写入前处于 COW 只读状态，原页地址与父进程保留的地址同为 `0x804CA000`。子进程的写指令触发页异常后，内核复制原页，将子 PTE 改为 `0x805D6000`，恢复写权限并清除 COW 标记。子进程随后重试原指令，将新页中的目标字节改为 `0xA5`；父进程继续访问原页，因此读回 `0x5A`。
 
-```c
-int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
-{
-    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
-    assert(USER_ACCESS(start, end));
-    if (to == NULL || from == NULL || to == from) {
-        return -E_INVAL;
-    }
+父进程记录 `parent-before` 时，子进程已经结束，父进程成为原探针页的最后持有者。该页仍保留 COW 标记。父进程后续写入触发单引用处理分支，内核在原页上恢复写权限，故 `parent-after` 的物理地址继续保持 `0x804CA000`。
 
-    while (start < end) {
-        /* Single-hart critical section; no process is scheduled here. */
-        bool intr_flag;
-        local_intr_save(intr_flag);
-        int ret = 0;
+**本次结果对应两条状态转换：子映射通过 CS→P 完成复制，父映射通过 C1→P 恢复原页写权限。** 四次快照同时解释了数据分离、权限变化与原页复用。
 
-        pte_t *src = get_pte(from, start, 0);
-        if (src == NULL) {
-            /* No lowest-level page table: skip this 2 MiB interval. */
-            local_intr_restore(intr_flag);
-            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
-            continue;
-        }
-        if (!(*src & PTE_V)) {
-            local_intr_restore(intr_flag);
-            start += PGSIZE;
-            continue;
-        }
+### 6.4 父进程写入的隔离检查
 
-        uint32_t perm = (uint32_t)(*src & 0x3FF);
-        /* This interface copies 4 KiB user leaf mappings only. */
-        if (!(perm & PTE_U) || !(perm & (PTE_R | PTE_X)) ||
-            ((perm & PTE_W) && !(perm & PTE_R))) {
-            ret = -E_INVAL;
-            goto page_out;
-        }
+**测试目的。** fork 后父子双方都持有共享数据。测试需要覆盖父进程先写入的路径，检查 `copy_range()` 对父映射的写权限调整。
 
-        pte_t *dst = get_pte(to, start, 1);
-        if (dst == NULL) {
-            ret = -E_NO_MEM;
-            goto page_out;
-        }
-        if (*dst != 0) {
-            ret = -E_INVAL;
-            goto page_out;
-        }
+**测试过程。** 父进程将探针字节设为 `0x22` 后 fork。父进程把自己的字节改为 `0x77`；子进程在 8 轮 `yield()` 之间检查该字节，每次都要求读回 `0x22`。父进程等待子进程结束后检查自身值为 `0x77`。
 
-        struct Page *page = pte2page(*src);
-        if (share) {
-            /* Repeated fork must preserve an existing COW marker. Truly
-             * read-only pages are shared without ever gaining that marker.
-             */
-            if (perm & (PTE_W | PTE_COW)) {
-                perm = (perm & ~PTE_W) | PTE_COW;
-            }
-            /* Publish the child mapping before restricting the parent.
-             * Failure leaves this parent PTE unchanged. page_insert itself
-             * increments the shared page's reference count exactly once.
-             */
-            ret = page_insert(to, page, start, perm);
-            if (ret == 0 && *src != pte_create(page2ppn(page), perm)) {
-                *src = pte_create(page2ppn(page), perm);
-                tlb_invalidate(from, start);
-            }
-        }
-        else {
-            /* An eager copy of a COW page is privately writable again. */
-            if (perm & PTE_COW) {
-                perm = (perm | PTE_W) & ~PTE_COW;
-            }
-            struct Page *new_page = alloc_page();
-            if (new_page == NULL) {
-                ret = -E_NO_MEM;
-                goto page_out;
-            }
-            memcpy(page2kva(new_page), page2kva(page), PGSIZE);
-            ret = page_insert(to, new_page, start, perm);
-            if (ret != 0) {
-                free_page(new_page);
-            }
-        }
+**测试结果与实验现象。** 图 1 中 `parent-writes` 为 `PASS`，父进程读回 `0x77`，子进程各次读取均满足初值断言。
 
-page_out:
-        local_intr_restore(intr_flag);
-        if (ret != 0) {
-            /* The caller owns partial-child cleanup. Remaining parent COW
-             * mappings stay valid, including the single-reference case.
-             */
-            return ret;
-        }
-        start += PGSIZE;
-    }
-    return 0;
-}
-```
+**原因分析。** 内核在 fork 的共享阶段同时清除父子 PTE 的 `PTE_W`。父进程写入时，处理器同样进入 COW 异常路径；内核为父进程准备可写页面，子进程继续访问原有内容。`yield()` 使父子交替运行，让子进程在多个调度点检查自己的数据。
 
-### A.3 do_cow_fault：写入资格与副本管理
+**父进程写入后，子进程仍持有原值，父子双方的写入隔离通过检查。**
 
-```c
-int do_cow_fault(struct mm_struct *mm, uintptr_t addr)
-{
-    if (mm == NULL || mm->pgdir == NULL) {
-        return -E_INVAL;
-    }
+### 6.5 多个子进程与再次 fork
 
-    /* This lab runs on one hart. Protect PTE/refcount changes from interrupts;
-     * SMP would additionally require shared-page locking and TLB shootdowns.
-     */
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    int ret = -E_INVAL;
+**测试目的。** 页面共享关系会随着继续 fork 而扩展。源页面此时可能已经满足 `W=0、COW=1`，测试需要覆盖这种页面继续参与进程复制的情形。
 
-    /* Also rejects invalid addresses, read-only VMAs and the stack guard. */
-    if (!user_mem_check(mm, addr, 1, 1)) {
-        goto out;
-    }
+**测试过程。** 父进程以 `0x22` 为探针初值，依次创建 4 个子进程。第 i 个子进程写入 `0x30+i`，在 3 轮 `yield()` 中核对自己的值，再以 i 为退出码结束。父进程逐个等待并检查退出码，随后检查自己的探针仍为 `0x22`。
 
-    uintptr_t va = ROUNDDOWN(addr, PGSIZE);
-    pte_t *ptep = get_pte(mm->pgdir, va, 0);
-    const pte_t required = PTE_V | PTE_U | PTE_R | PTE_COW;
-    if (ptep == NULL || (*ptep & required) != required || (*ptep & PTE_W)) {
-        goto out;
-    }
+接着，父进程创建一个子进程，该子进程继续创建孙进程。孙进程把探针改为 `0x99` 后退出，子进程和父进程在各自等待结束后都检查 `0x22`。
 
-    struct Page *old_page = pte2page(*ptep);
-    if (page_ref(old_page) < 1) {
-        goto out;
-    }
+**测试结果与实验现象。** 图 1 中 `multiple-forks` 为 `PASS`。4 个子进程完成各自的写入与退出码检查，孙进程写入后，上两级进程继续读回原值。
 
-    uint32_t perm = (uint32_t)(*ptep & 0x3FF);
-    perm = (perm | PTE_W | PTE_A | PTE_D) & ~PTE_COW;
+**原因分析。** `copy_range()` 将原有写权限与已有 COW 标记一起作为共享分支的判断条件。源页已经处于 COW 状态时，内核继续建立共享映射并增加引用。后续写入只替换写入方的 PTE，其他持有者继续依赖原页。多级 fork 把这一过程从父子两份映射扩展到多个映射，检验了持续共享与逐次分离的配合。
 
-    if (page_ref(old_page) == 1) {
-        /* Nobody else sees this page: permission restoration is sufficient. */
-        *ptep = pte_create(page2ppn(old_page), perm);
-        tlb_invalidate(mm->pgdir, va);
-        ret = 0;
-        goto out;
-    }
+**多个子进程及孙进程各自完成写入，原有持有者继续读回初值，多级共享关系通过隔离检查。**
 
-    struct Page *new_page = alloc_page();
-    if (new_page == NULL) {
-        ret = -E_NO_MEM;
-        goto out;
-    }
+### 6.6 跨页写入与边界字节检查
 
-    memcpy(page2kva(new_page), page2kva(old_page), PGSIZE);
-    /* page_insert acquires the new reference and drops the old one. */
-    ret = page_insert(mm->pgdir, new_page, va, perm);
-    if (ret != 0) {
-        free_page(new_page);
-    }
+**测试目的。** COW 以页为复制单位，跨页写入需要处理两个目标页。测试还需要检查写入区间的相邻字节，以确认修改范围与用户请求一致。
 
-out:
-    local_intr_restore(intr_flag);
-    return ret;
-}
-```
+**测试过程。** 父进程将按页对齐的两页缓冲区填充为 `0x5A`，再执行 fork。子进程从第一页末尾 4 字节处开始，逐字节写入 12 个 `0x37`，即覆盖第一页最后 4 字节和第二页最前 8 字节。子进程核对这 12 个字节，并检查区间前后相邻字节仍为 `0x5A`。父进程在等待结束后检查对应区域仍保持原值。
 
-### A.4 copy_to_user：逐页准备与数据写入
+**测试结果与实验现象。** 图 1 中 `cross-page` 为 `PASS`。子进程的目标区间满足写入断言，区间外两个相邻字节以及父进程对应区域保持初值。
 
-```c
-bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len)
-{
-    if (len == 0) {
-        return 1;
-    }
+**原因分析。** 逐字节访问使本例通过字节存储跨越页边界。第一页与第二页各自具有独立的 PTE，子进程首次修改对应页面时，内核分别处理其 COW 状态。写入仍由返回用户态后的原指令完成，因此字节修改范围由用户循环的边界确定。
 
-    /* Preserve the existing trusted-kernel-address case. */
-    if (mm == NULL) {
-        if (!user_mem_check(NULL, (uintptr_t)dst, len, 1)) {
-            return 0;
-        }
-        memcpy(dst, src, len);
-        return 1;
-    }
-    if (mm->pgdir == NULL) {
-        return 0;
-    }
+**两个目标页完成各自的数据分离，12 字节写入区间及其相邻字节符合测试输入。**
 
-    /* COW Challenge 2411033: the current lab uses one hart. Keep the PTEs
-     * stable from validation through the physical-alias writes below.
-     */
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    bool ret = 0;
-    uintptr_t addr = (uintptr_t)dst;
-    if (!user_mem_check(mm, addr, len, 1)) {
-        goto out;
-    }
+### 6.7 内核写回退出码的 COW 检查
 
-    uintptr_t end = addr + len;
-    const pte_t required = PTE_V | PTE_U | PTE_R | PTE_W;
+**测试目的。** 内核通过 wait 写回退出码时，也会修改用户页面。该路径需要在写入前处理共享映射，维护与用户写指令相同的数据隔离语义。
 
-    /* Prepare every destination page before copying any bytes. Failure may
-     * leave some pages private, but leaves the destination contents intact.
-     */
-    for (uintptr_t cur = addr; cur < end;
-         cur = ROUNDDOWN(cur, PGSIZE) + PGSIZE) {
-        pte_t *ptep = get_pte(mm->pgdir, cur, 0);
-        if (ptep == NULL) {
-            goto out;
-        }
-        if ((*ptep & PTE_COW) && do_cow_fault(mm, cur) != 0) {
-            goto out;
-        }
-        if ((*ptep & required) != required || (*ptep & PTE_COW)) {
-            goto out;
-        }
-    }
+**测试过程。** 父进程在独占一页的 `wait_page` 中写入 `0x12345678`，随后创建观察进程。观察进程持续检查这个值，并通过 `yield()` 让出 CPU。父进程再创建工作进程，工作进程以 `0x3344` 退出。
 
-    const char *from = src;
-    while (addr < end) {
-        pte_t *ptep = get_pte(mm->pgdir, addr, 0);
-        size_t count = PGSIZE - PGOFF(addr);
-        if (count > end - addr) {
-            count = end - addr;
-        }
+父进程将 `wait_page` 的起始地址传给 `waitpid()` 接收退出码。写回后，父进程检查 `0x3344`，再进行 8 轮 `yield()`，让观察进程继续检查原值，最后终止并回收观察进程。
 
-        /* Physical aliases also work when mm is not the active address
-         * space. The permission/COW checks above must precede these writes.
-         */
-        char *to = (char *)page2kva(pte2page(*ptep)) + PGOFF(addr);
-        if ((*ptep & (PTE_A | PTE_D)) != (PTE_A | PTE_D)) {
-            *ptep |= PTE_A | PTE_D;
-            tlb_invalidate(mm->pgdir, addr);
-        }
-        memcpy(to, from, count);
-        from += count;
-        addr += count;
-    }
-    ret = 1;
+**测试结果与实验现象。** 图 1 中 `wait-copyout` 为 `PASS`。父进程收到 `0x3344`，观察进程继续保持初值断言，随后按父进程发出的 kill 请求结束并完成回收。
 
-out:
-    local_intr_restore(intr_flag);
-    return ret;
-}
-```
+**原因分析。** 工作进程退出后，观察进程仍持有退出码所在的旧数据页。内核执行 `do_wait()` 时，经 `copy_to_user()` 检查父进程的目标页并处理 COW，再向父进程的私有页写入退出码。观察进程继续读取旧页，因此保留 `0x12345678`。让观察进程持续存活，保证了这次写回发生时旧数据页仍有其他持有者。
 
-### A.5 page_remove_pte：映射引用回收
+**父进程取得正确退出码，观察进程保留原值，内核写回路径通过共享页面隔离检查。**
 
-```c
-static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
-{
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    if (*ptep & PTE_V)
-    {
-        struct Page *page = pte2page(*ptep);
-        assert(page_ref(page) > 0);
-        /* Revoke this mapping before its last reference can be reused. */
-        *ptep = 0;
-        tlb_invalidate(pgdir, la);
-        if (page_ref_dec(page) == 0)
-        {
-            free_page(page);
-        }
-    }
-    local_intr_restore(intr_flag);
-}
-```
+### 6.8 真正只读页面的权限保护
 
-### A.6 page_table_empty 与 exit_range：下级页表回收
+**测试目的。** COW 页面与程序只读页都可能满足 `PTE_W=0`。测试需要核对内核依据原有写权限和 COW 标记处理写入，保留程序段的只读属性。
 
-```c
-static bool page_table_empty(pte_t *table)
-{
-    for (size_t i = 0; i < NPTEENTRY; i++) {
-        if (table[i] != 0) {
-            return 0;
-        }
-    }
-    return 1;
-}
+**测试过程。** 本次实验将 `readonly_page` 放入只读区域，并让子进程尝试把其中一个字节改为 `0xA5`。父进程通过 `waitpid()` 取得子进程退出码，并要求其等于 `-E_KILLED`。
 
-void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
-{
-    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
-    assert(USER_ACCESS(start, end));
-    assert(pgdir != NULL);
+**测试结果与实验现象。** 图 1 中 `readonly` 为 `PASS`。四次页表快照中，该只读页的虚拟地址为 `0x802000`，PTE 均保持 `W=0、COW=0`。子进程写入时产生编号为 `0xF` 的写页异常，故障地址指向 `0x802000`；父进程取得 `-E_KILLED` 并继续运行后续用例。
 
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    const pte_t leaf = PTE_R | PTE_W | PTE_X;
+**原因分析。** 内核给原本可写的共享页设置 `PTE_COW`，真正只读页继续保留原有权限。`do_cow_fault()` 先检查 VMA 写权限，再检查有效用户映射和 COW 标记；该次写入沿用户权限错误路径结束对应子进程。父进程通过等待接口取得退出状态，进程回收流程继续执行。
 
-    for (uintptr_t d1 = ROUNDDOWN(start, PDSIZE); d1 < end; d1 += PDSIZE) {
-        pde_t *pdep1 = &pgdir[PDX1(d1)];
-        if (!(*pdep1 & PTE_V) || (*pdep1 & leaf)) {
-            continue;
-        }
+**子进程按权限错误退出，父进程继续执行，程序只读段在 COW 扩展后保持保护。**
 
-        struct Page *pd_page = pde2page(*pdep1);
-        pde_t *pd0 = page2kva(pd_page);
-        uintptr_t begin = start > d1 ? start : d1;
-        uintptr_t limit = end < d1 + PDSIZE ? end : d1 + PDSIZE;
+### 6.9 反复退出与最终资源回收
 
-        for (uintptr_t d0 = ROUNDDOWN(begin, PTSIZE); d0 < limit; d0 += PTSIZE) {
-            pde_t *pdep0 = &pd0[PDX0(d0)];
-            if (!(*pdep0 & PTE_V) || (*pdep0 & leaf)) {
-                continue;
-            }
-            struct Page *pt_page = pde2page(*pdep0);
-            if (page_table_empty(page2kva(pt_page))) {
-                assert(page_ref(pt_page) == 1);
-                *pdep0 = 0;
-                /* Non-leaf changes require a full translation-cache fence
-                 * before the old page-table memory can be reused.
-                 */
-                flush_tlb();
-                page_ref_dec(pt_page);
-                free_page(pt_page);
-            }
-        }
+**测试目的。** 写时复制会增加共享引用，并在写入时替换映射。测试需要把创建、修改和退出重复组合，检查共享页引用与私有副本的生命周期。
 
-        /* Check ALL sibling entries, including those outside [start, end).
-         * The old local-range test could free a directory with live siblings.
-         */
-        if (page_table_empty(pd0)) {
-            assert(page_ref(pd_page) == 1);
-            *pdep1 = 0;
-            flush_tlb();
-            page_ref_dec(pd_page);
-            free_page(pd_page);
-        }
-    }
-    local_intr_restore(intr_flag);
-}
-```
+**测试过程。** 父进程连续进行 16 轮 fork。第 i 轮子进程将探针字节改为 i，再以 i 为退出码结束；父进程检查退出码和自身保留的 `0x22`。全部用户用例结束后，`init_main()` 等待并回收用户进程链，再执行进程与内存收尾断言。
 
-### A.7 exit_mmap：用户地址窗口清理
+**测试结果与实验现象。** 图 1 中 `repeated-exit` 和 `Final cleanup` 均为 `PASS`。16 轮子进程完成数据和退出码检查，最终执行到 `init check memory pass.` 对应的成功分支。
 
-```c
-void exit_mmap(struct mm_struct *mm)
-{
-    assert(mm != NULL && mm_count(mm) == 0);
-    pde_t *pgdir = mm->pgdir;
-    if (pgdir == NULL) {
-        return;
-    }
+**原因分析。** 内核在 `page_remove_pte()` 中撤销映射并减少引用。一个持有者退出后，剩余持有者继续使用原页；最后一个引用结束时，内核归还该数据页。各进程持有的下级页表则在清空后逐层回收，父进程通过 `do_wait()` 回收子进程的内核栈和 PCB。
 
-    /* COW Challenge 2411033: release mappings before private page tables.
-     * Scan the entire user window so partially built mappings/page tables
-     * from a failed fork or exec are not dependent on VMA insertion order.
-     * Kernel mappings and the root page itself are owned by other paths.
-     */
-    unmap_range(pgdir, USERBASE, USERTOP);
-    exit_range(pgdir, USERBASE, USERTOP);
-}
-```
+最终收尾检查包含三个层次：
 
-### A.8 地址翻译刷新
+| 检查层次 | 实际执行的检查 | 对应资源 |
+|---|---|---|
+| 进程关系 | 用户进程链结束后，进程数量为 2，检查 init 的子进程关系和进程链表 | PCB、父子关系与进程登记 |
+| 内核堆 | `kallocated()` 与进入用户程序前的记录相等 | VMA、地址空间管理结构及其他堆分配 |
+| 物理页 | 空闲页数量加上 SLOB 新增保留页后，与进入用户程序前的数量相等 | 用户数据页、用户页表、内核栈等物理页面 |
 
-```c
-void tlb_invalidate(pde_t *pgdir, uintptr_t la)
-{
-    asm volatile("sfence.vma %0" : : "r"(la) : "memory");
-}
+SLOB 使用 arena 页承载小块堆分配。内核在收尾时单独记录这部分保留页的增量，再比较物理页数量，使检查同时考虑分配器的保留策略与用户资源归还情况。
 
-static inline void flush_tlb()
-{
-    asm volatile("sfence.vma" ::: "memory");
-}
-```
+**本次结果表明，该轮 COW 用户进程链通过了现有的进程、堆分配和物理页收尾检查。**
+
+### 6.10 启用 COW 后的基础功能回归
+
+**测试目的。** COW 改造涉及 fork 页表、用户写异常、wait 写回和退出回收，这些路径同时服务于 Lab5 基础程序。本次实验在完成专项测试后执行 `make grade`，检查扩展与原有功能的配合。
+
+**测试过程。** 本次实验保留 `LAB5_USE_COW=1`，运行基础评分脚本。脚本在临时副本中注入基础检查，依次构建并执行 13 个用户程序，每项同时核对程序行为和公共检查输出。
+
+**测试结果与实验现象。** 图 2 显示 COW 开关为 1，评分终端的最终结果为 **`Total Score: 130/130`**。截图末段的 `yield`、`badarg`、`exit`、`spin` 和 `forktest` 均显示功能检查与公共输出检查为 `OK`。
+
+![图 2 启用 COW 后的 Lab5 基础评分](./images/C-grade.png)
+
+**图 2：`LAB5_USE_COW=1` 时，Lab5 基础评分达到 130/130。**
+
+13 个程序从以下几组行为覆盖本次扩展的关联路径：
+
+| 程序组 | 程序 | 与 COW 的关联 |
+|---|---|---|
+| 用户异常与权限检查 | `badsegment`、`divzero`、`softint`、`faultread`、`faultreadkernel`、`testbss` | 合法 COW 写入与其他用户异常沿各自的处理路径执行，程序装载和数据初始化保持原有行为 |
+| 用户态运行与页表查看 | `hello`、`pgdir` | 用户态进入、系统调用返回与页表访问继续工作 |
+| 调度与进程控制 | `yield`、`badarg`、`exit`、`spin`、`forktest` | 检查主动让出、参数处理、复制、等待、终止以及批量回收的配合 |
+
+**原因分析。** 专项程序集中检查共享页的状态变化，基础程序则把这些内存管理路径放回正常的用户程序生命周期。`exit` 和 `badarg` 经过 fork 与 wait，`spin` 覆盖调度、kill 和等待，`forktest` 反复创建并回收子进程。它们通过评分，说明这些既有场景在启用 COW 后仍满足评分脚本的功能要求。
+
+**本次基础回归结果为 130/130，COW 专项检查与基础功能检查均完成。**
+
+### 6.11 验证结论与状态转换的对应关系
+
+| 本次验证内容 | 对应的设计机制 | 实际结果 |
+|---|---|---|
+| fork 后的页面共享 | 父子映射指向原物理页，并保持 COW 只读状态 | `PTE evidence` 通过 |
+| 多引用页写入 | 写入方取得新页，完成 CS→P | 子写、父写与跨页用例通过 |
+| 单引用页写入 | 保留原物理页，完成 C1→P | 父进程写入前后 PA 相同，权限转为可写 |
+| 继续 fork | 为已有 COW 页新增共享映射 | 多子进程和孙进程用例通过 |
+| 内核写入用户页 | `copy_to_user()` 准备私有目标页后写回 | `wait-copyout` 通过 |
+| 真正只读页写入 | 保留只读属性，进入用户权限错误处理 | `readonly` 通过 |
+| 页面与进程生命周期 | 解除映射、减少引用、回收空页表及进程资源 | 重复退出与最终回收检查通过 |
+| 基础功能兼容 | 启用 COW 后执行原有用户程序 | 基础评分 130/130 |
+
+本次实验通过两张截图记录专项检查和基础回归结果，并通过上述数据、页表状态与回收条件解释各项 `PASS` 的判定依据。**在本次覆盖的进程创建、写入、等待和退出场景中，COW 的共享、分离、权限保护与回收路径符合设计。**
